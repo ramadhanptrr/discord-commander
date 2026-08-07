@@ -9,7 +9,7 @@ from commander.operations import OperatorOperations
 def build_panel_embed() -> discord.Embed:
     embed = discord.Embed(
         title="🎛️ Discord Commander",
-        description="Pilih operasi yang tersedia. Semua hasil dikirim ke control room ini.",
+        description="Choose an available operation. All results are sent to this control room.",
         colour=discord.Colour.blurple(),
         timestamp=discord.utils.utcnow(),
     )

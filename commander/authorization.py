@@ -39,7 +39,7 @@ class InteractionAuthorizer:
             interaction.channel_id,
             interaction.user.id,
         )
-        message = "Perintah ini hanya tersedia untuk operator di commander control room."
+        message = "This command is available only to authorized operators in the Commander control room."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:

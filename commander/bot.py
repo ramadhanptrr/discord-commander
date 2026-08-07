@@ -175,7 +175,7 @@ class CommanderBot(commands.Bot):
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
         logger.error("Unhandled application-command error", exc_info=error)
-        message = "Terjadi error internal saat memproses perintah. Coba lagi nanti."
+        message = "An internal error occurred while processing this command. Please try again later."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)

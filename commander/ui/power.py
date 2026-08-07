@@ -36,7 +36,7 @@ class PowerConfirmationView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self._requester_id:
             await interaction.response.send_message(
-                "Hanya operator yang memulai aksi ini yang dapat mengonfirmasi.",
+                "Only the operator who started this action can confirm it.",
                 ephemeral=True,
             )
             return False
@@ -54,7 +54,7 @@ class PowerConfirmationView(discord.ui.View):
     ) -> None:
         embed = discord.Embed(
             title="Power operation cancelled",
-            description="Tidak ada aksi yang dijalankan.",
+            description="No action was executed.",
             colour=discord.Colour.dark_grey(),
             timestamp=discord.utils.utcnow(),
         )

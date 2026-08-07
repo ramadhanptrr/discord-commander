@@ -114,7 +114,7 @@ class OperatorOperations:
 
         if operation == "wake":
             title = "🚀 Wake NAS"
-            description = "Kirim Wake-on-LAN packet untuk menyalakan NAS?"
+            description = "Send a Wake-on-LAN packet to power on the NAS?"
             colour = discord.Colour.green()
         else:
             title = "🛑 Shutdown NAS"
@@ -128,7 +128,7 @@ class OperatorOperations:
             operations=self,
         )
         embed = _timestamped_embed(title=title, description=description, colour=colour)
-        embed.set_footer(text="Konfirmasi hanya berlaku 60 detik")
+        embed.set_footer(text="Confirmation expires after 60 seconds")
         await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
         try:
@@ -142,7 +142,7 @@ class OperatorOperations:
         """Run the confirmed action while holding the single NAS power-operation lock."""
         if not await self._power_state.acquire(operation):
             await interaction.response.send_message(
-                "⚠️ Operasi power NAS lain masih berjalan. Tunggu sampai selesai.",
+                "⚠️ Another NAS power operation is already in progress. Please wait for it to finish.",
                 ephemeral=False,
             )
             return
@@ -151,7 +151,7 @@ class OperatorOperations:
             allowed, wait_seconds = await self._limiter.is_allowed(interaction.user.id, operation)
             if not allowed:
                 await interaction.response.send_message(
-                    f"⚠️ Rate limit tercapai. Coba lagi dalam {wait_seconds} detik.",
+                    f"⚠️ Rate limit reached. Try again in {wait_seconds} seconds.",
                     ephemeral=False,
                 )
                 return
@@ -175,13 +175,13 @@ class OperatorOperations:
             if interaction.response.is_done():
                 embed = _timestamped_embed(
                     title="⚠️ NAS operation failed",
-                    description="Operasi NAS tidak dapat diselesaikan.",
+                    description="The NAS operation could not be completed.",
                     colour=discord.Colour.red(),
                 )
                 await interaction.edit_original_response(content=None, embed=embed)
             else:
                 await interaction.response.send_message(
-                    "⚠️ Operasi NAS tidak dapat diselesaikan.", ephemeral=False
+                    "⚠️ The NAS operation could not be completed.", ephemeral=False
                 )
         finally:
             await self._power_state.release(operation)
@@ -199,7 +199,7 @@ class OperatorOperations:
 
         await interaction.edit_original_response(
             content=None,
-            embed=self._power_progress_embed("wake", "Wake-on-LAN packet terkirim. Menunggu NAS boot..."),
+            embed=self._power_progress_embed("wake", "Wake-on-LAN packet sent. Waiting for NAS boot..."),
         )
         start = asyncio.get_running_loop().time()
         for attempt in range(1, 25):
@@ -208,7 +208,7 @@ class OperatorOperations:
                 elapsed = int(asyncio.get_running_loop().time() - start)
                 embed = _timestamped_embed(
                     title="🟢 NAS online",
-                    description=f"NAS merespons setelah sekitar {elapsed} detik.",
+                    description=f"NAS responded after approximately {elapsed} seconds.",
                     colour=discord.Colour.green(),
                 )
                 embed.set_footer(text="Wake NAS • Commander control room")
@@ -218,7 +218,7 @@ class OperatorOperations:
             await interaction.edit_original_response(
                 content=None,
                 embed=self._power_progress_embed(
-                    "wake", f"Menunggu NAS boot... percobaan {attempt}/24"
+                    "wake", f"Waiting for NAS boot... attempt {attempt}/24"
                 ),
             )
 
@@ -240,7 +240,7 @@ class OperatorOperations:
                 io.BytesIO(result.output.encode("utf-8")),
                 filename="nas-shutdown.txt",
             )
-            description = "Output operasi dilampirkan sebagai `nas-shutdown.txt`."
+            description = "Operation output is attached as `nas-shutdown.txt`."
             await interaction.edit_original_response(
                 content=None,
                 embed=_timestamped_embed(title=title, description=description, colour=colour),
