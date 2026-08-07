@@ -85,6 +85,23 @@ def _positive_int(key: str, default: int | None = None) -> int:
     return value
 
 
+def _non_negative_int(key: str, default: int | None = None) -> int:
+    raw = _secrets.get(key).strip()
+    if not raw:
+        if default is None:
+            raise RuntimeError(f"Missing required secret: {key}")
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"Secret {key} must be an integer") from error
+
+    if value < 0:
+        raise RuntimeError(f"Secret {key} must be zero or a positive integer")
+    return value
+
+
 def _snowflake_list(key: str) -> frozenset[int]:
     raw = _required(key)
     values: set[int] = set()
@@ -183,6 +200,11 @@ class NetworkConfig:
     host: str
     manual_probe_count: int
     ping_timeout_seconds: int
+    watchdog_interval_seconds: int
+    watchdog_probe_count: int
+    watchdog_recovery_probe_count: int
+    anchor_host: str | None
+    confirm_delay_seconds: int
 
 
 @dataclass(frozen=True)
@@ -197,6 +219,13 @@ class Config:
 def load_config() -> Config:
     """Build immutable runtime configuration. No secret values are logged."""
     ssh_key_path = _secrets.get("SSH_KEY_PATH").strip() or None
+
+    anchor_raw = _secrets.get("NETWORK_ANCHOR_HOST").strip()
+    anchor_host = None
+    if anchor_raw:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", anchor_raw):
+            raise RuntimeError("Secret NETWORK_ANCHOR_HOST must be a safe hostname or IP address")
+        anchor_host = anchor_raw
 
     return Config(
         discord=DiscordConfig(
@@ -232,5 +261,12 @@ def load_config() -> Config:
             host=_host("MIKROTIK_HOST"),
             manual_probe_count=_positive_int("NETWORK_RECOVERY_PING_COUNT", default=5),
             ping_timeout_seconds=_positive_int("NETWORK_PING_TIMEOUT", default=3),
+            watchdog_interval_seconds=_positive_int("TIMED_OUT_INTERVAL", default=10) * 60,
+            watchdog_probe_count=_positive_int("NETWORK_PING_COUNT", default=10),
+            watchdog_recovery_probe_count=_positive_int(
+                "NETWORK_RECOVERY_PING_COUNT", default=5
+            ),
+            anchor_host=anchor_host,
+            confirm_delay_seconds=_non_negative_int("NETWORK_CONFIRM_DELAY", default=15),
         ),
     )

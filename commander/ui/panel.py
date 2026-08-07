@@ -15,10 +15,10 @@ def build_panel_embed() -> discord.Embed:
     )
     embed.add_field(
         name="Available now",
-        value="Status Network • Edge Info • Wake NAS • Shutdown NAS",
+        value="Ping • Status NAS • Status Network • Edge Info • Wake NAS • Shutdown NAS",
         inline=False,
     )
-    embed.add_field(name="Next migration phase", value="NAS status", inline=False)
+    embed.add_field(name="Help", value="Use the Help button to view every command.", inline=False)
     embed.set_footer(text="Control room only")
     return embed
 
@@ -56,6 +56,18 @@ class CommanderPanel(discord.ui.View):
             await self._operations.edge_info(interaction)
 
     @discord.ui.button(
+        label="Status NAS",
+        style=discord.ButtonStyle.secondary,
+        custom_id="commander:nas-status",
+        row=0,
+    )
+    async def nas_status(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.nas_status(interaction)
+
+    @discord.ui.button(
         label="Wake NAS",
         style=discord.ButtonStyle.success,
         custom_id="commander:nas-wake",
@@ -80,13 +92,25 @@ class CommanderPanel(discord.ui.View):
             await self._operations.request_shutdown(interaction, self._authorizer)
 
     @discord.ui.button(
-        label="NAS Status (soon)",
+        label="Help",
         style=discord.ButtonStyle.secondary,
-        custom_id="commander:nas-status-pending",
-        disabled=True,
-        row=1,
+        custom_id="commander:help",
+        row=2,
     )
-    async def nas_status_pending(
+    async def help(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        return
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.help(interaction)
+
+    @discord.ui.button(
+        label="Ping",
+        style=discord.ButtonStyle.secondary,
+        custom_id="commander:ping",
+        row=2,
+    )
+    async def ping(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.ping(interaction)

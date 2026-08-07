@@ -15,8 +15,9 @@ class NetworkChecker:
     def __init__(self, config: NetworkConfig) -> None:
         self._config = config
 
-    def is_reachable(self) -> bool:
-        count = self._config.manual_probe_count
+    def is_reachable(self, host: str | None = None, count: int | None = None) -> bool:
+        host = host or self._config.host
+        count = count or self._config.manual_probe_count
         timeout = self._config.ping_timeout_seconds
         command = [
             "ping",
@@ -26,7 +27,7 @@ class NetworkChecker:
             "1",
             "-W",
             str(timeout),
-            self._config.host,
+            host,
         ]
 
         try:
@@ -37,13 +38,13 @@ class NetworkChecker:
                 timeout=count + timeout + 10,
             )
         except subprocess.TimeoutExpired:
-            logger.warning("Ping to %s exceeded its subprocess timeout", self._config.host)
+            logger.warning("Ping to %s exceeded its subprocess timeout", host)
             return False
         except FileNotFoundError:
             logger.error("The `ping` binary is unavailable; install iputils-ping in the image")
             return False
         except Exception:
-            logger.exception("Ping to %s failed unexpectedly", self._config.host)
+            logger.exception("Ping to %s failed unexpectedly", host)
             return False
 
         return result.returncode == 0

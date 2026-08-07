@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import discord
@@ -10,6 +11,7 @@ import discord
 from commander.config import Config
 from commander.edge import EdgeController
 from commander.nas import NasController
+from commander.netmonitor import NetworkWatchdog, format_duration
 from commander.network import NetworkChecker
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
@@ -59,6 +61,60 @@ class OperatorOperations:
         self._nas = nas
         self._power_state = power_state
         self._limiter = limiter
+        self._network_watchdog: NetworkWatchdog | None = None
+
+    def set_network_watchdog(self, watchdog: NetworkWatchdog) -> None:
+        self._network_watchdog = watchdog
+
+    async def ping(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("🏓 Pong!", ephemeral=False)
+
+    async def help(self, interaction: discord.Interaction) -> None:
+        embed = _timestamped_embed(
+            title="📖 Discord Commander",
+            description="Available control-room commands:",
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(name="`/ping`", value="Bot health check", inline=False)
+        embed.add_field(name="`/status nas`", value="Check NAS reachability", inline=False)
+        embed.add_field(name="`/status net`", value="Check home network reachability", inline=False)
+        embed.add_field(name="`/wake nas`", value="Wake NAS after confirmation", inline=False)
+        embed.add_field(
+            name="`/shutdown nas`", value="Gracefully shut down NAS after confirmation", inline=False
+        )
+        embed.add_field(name="`/edge info`", value="Run the fixed edge information script", inline=False)
+        embed.add_field(name="`/start`", value="Show the Commander welcome panel", inline=False)
+        embed.add_field(name="`/panel`", value="Show the interactive control panel", inline=False)
+        embed.set_footer(text="Control room only")
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+
+    async def nas_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=False)
+        try:
+            online = await asyncio.to_thread(self._nas.is_online)
+        except Exception:
+            logger.exception("Unexpected failure while checking NAS status")
+            embed = _timestamped_embed(
+                title="⚠️ NAS status unavailable",
+                description="The NAS reachability check could not be completed.",
+                colour=discord.Colour.red(),
+            )
+        else:
+            if online:
+                embed = _timestamped_embed(
+                    title="🟢 NAS online",
+                    description="NAS responded to the MikroTik reachability check.",
+                    colour=discord.Colour.green(),
+                )
+            else:
+                embed = _timestamped_embed(
+                    title="🔴 NAS offline",
+                    description="NAS did not respond to the MikroTik reachability check.",
+                    colour=discord.Colour.red(),
+                )
+
+        embed.set_footer(text="Manual check • Commander control room")
+        await interaction.edit_original_response(content=None, embed=embed)
 
     async def network_status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True, ephemeral=False)
@@ -90,6 +146,18 @@ class OperatorOperations:
                     colour=discord.Colour.red(),
                 )
 
+        if self._network_watchdog and self._network_watchdog.is_down:
+            downtime = (
+                format_duration(time.time() - self._network_watchdog.down_since)
+                if self._network_watchdog.down_since is not None
+                else "unknown"
+            )
+            embed.add_field(
+                name="Watchdog state",
+                value=f"DOWN for {downtime}.",
+                inline=False,
+            )
+
         embed.set_footer(text="Manual check • Commander control room")
         await interaction.edit_original_response(content=None, embed=embed)
 
@@ -118,7 +186,7 @@ class OperatorOperations:
             colour = discord.Colour.green()
         else:
             title = "🛑 Shutdown NAS"
-            description = "Jalankan graceful shutdown pada NAS?"
+            description = "Run a graceful shutdown on the NAS?"
             colour = discord.Colour.red()
 
         view = PowerConfirmationView(

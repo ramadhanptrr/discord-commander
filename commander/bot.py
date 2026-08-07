@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
@@ -12,7 +13,9 @@ from commander.edge import EdgeController
 from commander.logger import setup_logger
 from commander.mikrotik import MikroTikClient
 from commander.nas import NasController
+from commander.netmonitor import NetworkWatchdog
 from commander.network import NetworkChecker
+from commander.notifier import DiscordWatchdogNotifier
 from commander.operations import OperatorOperations
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
@@ -34,6 +37,11 @@ class StatusCommandGroup(app_commands.Group):
     async def net(self, interaction: discord.Interaction) -> None:
         if await self._authorizer.require_operator(interaction):
             await self._operations.network_status(interaction)
+
+    @app_commands.command(name="nas", description="Check NAS reachability")
+    async def nas(self, interaction: discord.Interaction) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.nas_status(interaction)
 
 
 class EdgeCommandGroup(app_commands.Group):
@@ -89,18 +97,54 @@ class CommanderBot(commands.Bot):
         self._config = config
         self._authorizer = InteractionAuthorizer(config.discord)
         mikrotik = MikroTikClient(config.mikrotik)
+        network_checker = NetworkChecker(config.network)
         self._operations = OperatorOperations(
             config,
             EdgeController(config.edge),
-            NetworkChecker(config.network),
+            network_checker,
             NasController(config.nas, mikrotik),
             PowerOperationState(),
             RateLimiter(),
         )
+        self._network_watchdog = NetworkWatchdog(
+            network_checker,
+            config.network,
+            DiscordWatchdogNotifier(
+                self,
+                config.discord.watchdog_channel_id,
+                config.network.watchdog_interval_seconds,
+            ),
+        )
+        self._operations.set_network_watchdog(self._network_watchdog)
+        self._watchdog_task: asyncio.Task[None] | None = None
         self._guilds = [discord.Object(id=guild_id) for guild_id in config.discord.guild_ids]
 
         self.tree.add_command(
             StatusCommandGroup(self._authorizer, self._operations),
+            guilds=self._guilds,
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="ping",
+                description="Check whether Commander is online",
+                callback=self.ping,
+            ),
+            guilds=self._guilds,
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="help",
+                description="Show Commander commands",
+                callback=self.help,
+            ),
+            guilds=self._guilds,
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="start",
+                description="Show the Commander welcome panel",
+                callback=self.start,
+            ),
             guilds=self._guilds,
         )
         self.tree.add_command(
@@ -157,19 +201,52 @@ class CommanderBot(commands.Bot):
                 raise RuntimeError(
                     f"Configured Discord {label} channel ({channel_id}) is outside allowed guilds"
                 )
+            if not isinstance(channel, discord.abc.Messageable):
+                raise RuntimeError(
+                    f"Configured Discord {label} channel ({channel_id}) cannot receive messages"
+                )
 
     async def show_panel(self, interaction: discord.Interaction) -> None:
         if not await self._authorizer.require_operator(interaction):
             return
+        await self._send_panel(interaction)
 
+    async def start(self, interaction: discord.Interaction) -> None:
+        if not await self._authorizer.require_operator(interaction):
+            return
+        await self._send_panel(interaction, content="🤖 Discord Commander is active.")
+
+    async def _send_panel(self, interaction: discord.Interaction, content: str | None = None) -> None:
         await interaction.response.send_message(
+            content=content,
             embed=build_panel_embed(),
             view=CommanderPanel(self._authorizer, self._operations),
             ephemeral=False,
         )
 
+    async def ping(self, interaction: discord.Interaction) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.ping(interaction)
+
+    async def help(self, interaction: discord.Interaction) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.help(interaction)
+
     async def on_ready(self) -> None:
         logger.info("Discord Commander connected as %s", self.user)
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(
+                self._network_watchdog.run(), name="network-watchdog"
+            )
+
+    async def close(self) -> None:
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+        await super().close()
 
     async def on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
