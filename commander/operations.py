@@ -29,7 +29,8 @@ def _timestamped_embed(
 
 def _code_block(value: str) -> str:
     # A zero-width space prevents script output from closing the fence early.
-    return f"```text\n{value.replace('```', '``\u200b`')}\n```"
+    escaped_value = value.replace("```", "``\u200b`")
+    return f"```text\n{escaped_value}\n```"
 
 
 class OperatorOperations:
