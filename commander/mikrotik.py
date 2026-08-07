@@ -52,7 +52,9 @@ class MikroTikClient:
         return success and "received=0" not in output.lower()
 
     def send_wol(self, mac: str, interface: str) -> tuple[bool, str | None]:
-        success, output = self._ssh(f"/tool wol interface={interface} mac={mac}")
+        # Interface names may contain spaces. Validation rejects quotes and RouterOS control
+        # characters, so quoting preserves the configured name without allowing command injection.
+        success, output = self._ssh(f'/tool wol interface="{interface}" mac={mac}')
         if success:
             return True, None
         return False, output or "Wake-on-LAN request failed."

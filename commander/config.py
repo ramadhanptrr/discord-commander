@@ -136,7 +136,7 @@ def _mac_address(key: str) -> str:
 
 def _router_interface(key: str) -> str:
     value = _required(key)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]*", value):
         raise RuntimeError(f"Secret {key} must be a safe RouterOS interface name")
     return value
 
