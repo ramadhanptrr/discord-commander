@@ -127,6 +127,20 @@ def _script_path(key: str) -> str:
     return value
 
 
+def _mac_address(key: str) -> str:
+    value = _required(key).upper()
+    if not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", value):
+        raise RuntimeError(f"Secret {key} must be a colon-separated MAC address")
+    return value
+
+
+def _router_interface(key: str) -> str:
+    value = _required(key)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise RuntimeError(f"Secret {key} must be a safe RouterOS interface name")
+    return value
+
+
 @dataclass(frozen=True)
 class DiscordConfig:
     bot_token: str
@@ -145,6 +159,26 @@ class EdgeConfig:
 
 
 @dataclass(frozen=True)
+class MikroTikConfig:
+    host: str
+    port: int
+    username: str
+    ssh_key_path: str | None
+
+
+@dataclass(frozen=True)
+class NasConfig:
+    ip: str
+    mac: str
+    wol_interface: str
+    ssh_host: str
+    ssh_port: int
+    ssh_user: str
+    shutdown_script: str
+    ssh_key_path: str | None
+
+
+@dataclass(frozen=True)
 class NetworkConfig:
     host: str
     manual_probe_count: int
@@ -155,11 +189,15 @@ class NetworkConfig:
 class Config:
     discord: DiscordConfig
     edge: EdgeConfig
+    mikrotik: MikroTikConfig
+    nas: NasConfig
     network: NetworkConfig
 
 
 def load_config() -> Config:
     """Build immutable runtime configuration. No secret values are logged."""
+    ssh_key_path = _secrets.get("SSH_KEY_PATH").strip() or None
+
     return Config(
         discord=DiscordConfig(
             bot_token=_required("DISCORD_BOT_TOKEN"),
@@ -173,6 +211,22 @@ def load_config() -> Config:
             ssh_port=_positive_int("EDGE_SSH_PORT", default=22),
             ssh_user=_ssh_username("EDGE_SSH_USER"),
             info_script=_script_path("EDGE_INFO_SCRIPT"),
+        ),
+        mikrotik=MikroTikConfig(
+            host=_host("MIKROTIK_HOST"),
+            port=_positive_int("MIKROTIK_PORT", default=22),
+            username=_ssh_username("MIKROTIK_USERNAME"),
+            ssh_key_path=ssh_key_path,
+        ),
+        nas=NasConfig(
+            ip=_host("NAS_IP"),
+            mac=_mac_address("NAS_MAC"),
+            wol_interface=_router_interface("NAS_WOL_INTERFACE"),
+            ssh_host=_host("NAS_IP"),
+            ssh_port=_positive_int("NAS_SSH_PORT", default=22),
+            ssh_user=_ssh_username("NAS_USER"),
+            shutdown_script=_script_path("NAS_SHUTDOWN_SCRIPT"),
+            ssh_key_path=ssh_key_path,
         ),
         network=NetworkConfig(
             host=_host("MIKROTIK_HOST"),

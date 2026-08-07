@@ -10,8 +10,12 @@ from commander.authorization import InteractionAuthorizer
 from commander.config import Config, load_config
 from commander.edge import EdgeController
 from commander.logger import setup_logger
+from commander.mikrotik import MikroTikClient
+from commander.nas import NasController
 from commander.network import NetworkChecker
 from commander.operations import OperatorOperations
+from commander.power_state import PowerOperationState
+from commander.ratelimit import RateLimiter
 from commander.ui.panel import CommanderPanel, build_panel_embed
 
 
@@ -46,6 +50,34 @@ class EdgeCommandGroup(app_commands.Group):
             await self._operations.edge_info(interaction)
 
 
+class WakeCommandGroup(app_commands.Group):
+    def __init__(
+        self, authorizer: InteractionAuthorizer, operations: OperatorOperations
+    ) -> None:
+        super().__init__(name="wake", description="Wake device operations")
+        self._authorizer = authorizer
+        self._operations = operations
+
+    @app_commands.command(name="nas", description="Request Wake-on-LAN for NAS")
+    async def nas(self, interaction: discord.Interaction) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.request_wake(interaction, self._authorizer)
+
+
+class ShutdownCommandGroup(app_commands.Group):
+    def __init__(
+        self, authorizer: InteractionAuthorizer, operations: OperatorOperations
+    ) -> None:
+        super().__init__(name="shutdown", description="Shutdown device operations")
+        self._authorizer = authorizer
+        self._operations = operations
+
+    @app_commands.command(name="nas", description="Request graceful NAS shutdown")
+    async def nas(self, interaction: discord.Interaction) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.request_shutdown(interaction, self._authorizer)
+
+
 class CommanderBot(commands.Bot):
     """Discord transport for the first Commander migration phase."""
 
@@ -56,10 +88,14 @@ class CommanderBot(commands.Bot):
 
         self._config = config
         self._authorizer = InteractionAuthorizer(config.discord)
+        mikrotik = MikroTikClient(config.mikrotik)
         self._operations = OperatorOperations(
             config,
             EdgeController(config.edge),
             NetworkChecker(config.network),
+            NasController(config.nas, mikrotik),
+            PowerOperationState(),
+            RateLimiter(),
         )
         self._guilds = [discord.Object(id=guild_id) for guild_id in config.discord.guild_ids]
 
@@ -69,6 +105,14 @@ class CommanderBot(commands.Bot):
         )
         self.tree.add_command(
             EdgeCommandGroup(self._authorizer, self._operations),
+            guilds=self._guilds,
+        )
+        self.tree.add_command(
+            WakeCommandGroup(self._authorizer, self._operations),
+            guilds=self._guilds,
+        )
+        self.tree.add_command(
+            ShutdownCommandGroup(self._authorizer, self._operations),
             guilds=self._guilds,
         )
         self.tree.add_command(

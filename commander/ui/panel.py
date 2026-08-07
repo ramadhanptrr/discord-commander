@@ -13,14 +13,18 @@ def build_panel_embed() -> discord.Embed:
         colour=discord.Colour.blurple(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="Available now", value="Status Network • Edge Info", inline=False)
-    embed.add_field(name="Next migration phase", value="NAS status • Wake NAS • Shutdown NAS", inline=False)
+    embed.add_field(
+        name="Available now",
+        value="Status Network • Edge Info • Wake NAS • Shutdown NAS",
+        inline=False,
+    )
+    embed.add_field(name="Next migration phase", value="NAS status", inline=False)
     embed.set_footer(text="Control room only")
     return embed
 
 
 class CommanderPanel(discord.ui.View):
-    """Persistent first-phase panel; active buttons share command authorization."""
+    """Persistent control-room panel; active buttons share command authorization."""
 
     def __init__(self, authorizer: InteractionAuthorizer, operations: OperatorOperations) -> None:
         super().__init__(timeout=None)
@@ -52,6 +56,30 @@ class CommanderPanel(discord.ui.View):
             await self._operations.edge_info(interaction)
 
     @discord.ui.button(
+        label="Wake NAS",
+        style=discord.ButtonStyle.success,
+        custom_id="commander:nas-wake",
+        row=1,
+    )
+    async def wake_nas(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.request_wake(interaction, self._authorizer)
+
+    @discord.ui.button(
+        label="Shutdown NAS",
+        style=discord.ButtonStyle.danger,
+        custom_id="commander:nas-shutdown",
+        row=1,
+    )
+    async def shutdown_nas(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if await self._authorizer.require_operator(interaction):
+            await self._operations.request_shutdown(interaction, self._authorizer)
+
+    @discord.ui.button(
         label="NAS Status (soon)",
         style=discord.ButtonStyle.secondary,
         custom_id="commander:nas-status-pending",
@@ -59,30 +87,6 @@ class CommanderPanel(discord.ui.View):
         row=1,
     )
     async def nas_status_pending(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        return
-
-    @discord.ui.button(
-        label="Wake NAS (soon)",
-        style=discord.ButtonStyle.success,
-        custom_id="commander:nas-wake-pending",
-        disabled=True,
-        row=1,
-    )
-    async def nas_wake_pending(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        return
-
-    @discord.ui.button(
-        label="Shutdown NAS (soon)",
-        style=discord.ButtonStyle.danger,
-        custom_id="commander:nas-shutdown-pending",
-        disabled=True,
-        row=1,
-    )
-    async def nas_shutdown_pending(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         return
