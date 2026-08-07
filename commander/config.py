@@ -192,7 +192,15 @@ class NasConfig:
     ssh_port: int
     ssh_user: str
     shutdown_script: str
+    uptime_script: str
     ssh_key_path: str | None
+
+
+@dataclass(frozen=True)
+class NasWatchdogConfig:
+    check_interval_seconds: int
+    max_age_seconds: int
+    reminder_interval_seconds: int
 
 
 @dataclass(frozen=True)
@@ -213,6 +221,7 @@ class Config:
     edge: EdgeConfig
     mikrotik: MikroTikConfig
     nas: NasConfig
+    nas_watchdog: NasWatchdogConfig
     network: NetworkConfig
 
 
@@ -255,7 +264,13 @@ def load_config() -> Config:
             ssh_port=_positive_int("NAS_SSH_PORT", default=22),
             ssh_user=_ssh_username("NAS_USER"),
             shutdown_script=_script_path("NAS_SHUTDOWN_SCRIPT"),
+            uptime_script=_script_path("NAS_UPTIME_SCRIPT"),
             ssh_key_path=ssh_key_path,
+        ),
+        nas_watchdog=NasWatchdogConfig(
+            check_interval_seconds=_positive_int("NAS_MONITOR_INTERVAL", default=60),
+            max_age_seconds=_positive_int("NAS_MAX_AGE_MINUTE") * 60,
+            reminder_interval_seconds=_positive_int("NAS_MAX_AGE_REMINDER_MINUTE") * 60,
         ),
         network=NetworkConfig(
             host=_host("MIKROTIK_HOST"),

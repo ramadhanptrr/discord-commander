@@ -51,3 +51,22 @@ class DiscordWatchdogNotifier:
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    async def send_nas_uptime_reminder(self, uptime: float) -> None:
+        duration = format_duration(uptime)
+        embed = discord.Embed(
+            title="⚠️ NAS still online",
+            description=f"NAS has been online for {duration}.",
+            colour=discord.Colour.yellow(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Suggested action",
+            value="Use `/shutdown nas` or the Commander control panel when it is no longer needed.",
+            inline=False,
+        )
+        embed.set_footer(text="NAS uptime watchdog • Automatic reminder")
+        await (await self._channel()).send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )

@@ -13,6 +13,7 @@ from commander.edge import EdgeController
 from commander.logger import setup_logger
 from commander.mikrotik import MikroTikClient
 from commander.nas import NasController
+from commander.nasmonitor import NasUptimeWatchdog
 from commander.netmonitor import NetworkWatchdog
 from commander.network import NetworkChecker
 from commander.notifier import DiscordWatchdogNotifier
@@ -98,25 +99,35 @@ class CommanderBot(commands.Bot):
         self._authorizer = InteractionAuthorizer(config.discord)
         mikrotik = MikroTikClient(config.mikrotik)
         network_checker = NetworkChecker(config.network)
+        power_state = PowerOperationState()
+        watchdog_notifier = DiscordWatchdogNotifier(
+            self,
+            config.discord.watchdog_channel_id,
+            config.network.watchdog_interval_seconds,
+        )
+        nas = NasController(config.nas, mikrotik)
         self._operations = OperatorOperations(
             config,
             EdgeController(config.edge),
             network_checker,
-            NasController(config.nas, mikrotik),
-            PowerOperationState(),
+            nas,
+            power_state,
             RateLimiter(),
         )
         self._network_watchdog = NetworkWatchdog(
             network_checker,
             config.network,
-            DiscordWatchdogNotifier(
-                self,
-                config.discord.watchdog_channel_id,
-                config.network.watchdog_interval_seconds,
-            ),
+            watchdog_notifier,
+        )
+        self._nas_uptime_watchdog = NasUptimeWatchdog(
+            nas,
+            config.nas_watchdog,
+            power_state,
+            watchdog_notifier,
         )
         self._operations.set_network_watchdog(self._network_watchdog)
-        self._watchdog_task: asyncio.Task[None] | None = None
+        self._network_watchdog_task: asyncio.Task[None] | None = None
+        self._nas_uptime_watchdog_task: asyncio.Task[None] | None = None
         self._guilds = [discord.Object(id=guild_id) for guild_id in config.discord.guild_ids]
 
         self.tree.add_command(
@@ -143,7 +154,7 @@ class CommanderBot(commands.Bot):
             app_commands.Command(
                 name="start",
                 description="Show the Commander welcome panel",
-                callback=self.start,
+                callback=self.show_start,
             ),
             guilds=self._guilds,
         )
@@ -211,7 +222,7 @@ class CommanderBot(commands.Bot):
             return
         await self._send_panel(interaction)
 
-    async def start(self, interaction: discord.Interaction) -> None:
+    async def show_start(self, interaction: discord.Interaction) -> None:
         if not await self._authorizer.require_operator(interaction):
             return
         await self._send_panel(interaction, content="🤖 Discord Commander is active.")
@@ -234,18 +245,32 @@ class CommanderBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Discord Commander connected as %s", self.user)
-        if self._watchdog_task is None or self._watchdog_task.done():
-            self._watchdog_task = asyncio.create_task(
+        if self._network_watchdog_task is None or self._network_watchdog_task.done():
+            self._network_watchdog_task = asyncio.create_task(
                 self._network_watchdog.run(), name="network-watchdog"
+            )
+        if self._nas_uptime_watchdog_task is None or self._nas_uptime_watchdog_task.done():
+            self._nas_uptime_watchdog_task = asyncio.create_task(
+                self._nas_uptime_watchdog.run(), name="nas-uptime-watchdog"
             )
 
     async def close(self) -> None:
-        if self._watchdog_task is not None and not self._watchdog_task.done():
-            self._watchdog_task.cancel()
+        watchdog_tasks = (
+            self._network_watchdog_task,
+            self._nas_uptime_watchdog_task,
+        )
+        for task in watchdog_tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        for task in watchdog_tasks:
+            if task is None:
+                continue
             try:
-                await self._watchdog_task
+                await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.exception("Watchdog task ended with an unexpected error during shutdown")
         await super().close()
 
     async def on_app_command_error(
