@@ -163,7 +163,7 @@ def load_config() -> Config:
     return Config(
         discord=DiscordConfig(
             bot_token=_required("DISCORD_BOT_TOKEN"),
-            guild_ids=_snowflake_list("DISCORD_GUILD_ID"),
+            guild_ids=_snowflake_list("DISCORD_GUILD_IDS"),
             control_room_channel_id=_positive_int("DISCORD_CONTROL_ROOM_CHANNEL_ID"),
             watchdog_channel_id=_positive_int("DISCORD_WATCHDOG_CHANNEL_ID"),
             allowed_user_ids=_snowflake_list("DISCORD_ALLOWED_USER_IDS"),
