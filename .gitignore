@@ -1,0 +1,40 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Env / secrets
+.env
+.env.*
+.infisical.json
+
+# Keys & certs
+*.pem
+*.key
+*.crt
+
+# WireGuard
+wg*.conf
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / AI tools
+.vscode/
+.idea/
+.claude/
+
+# Docker
+docker-compose.override.yml
+
+# Docs (private/internal documentation)
+docs/
+
+# Private migration notes
+MIGRATION_PLAN.md

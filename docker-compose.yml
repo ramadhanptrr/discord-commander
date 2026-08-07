@@ -1,0 +1,26 @@
+services:
+  commander:
+    build: .
+    container_name: discord-commander
+    restart: unless-stopped
+    secrets:
+      - infisical_client_id
+      - infisical_client_secret
+      - infisical_project_id
+    environment:
+      INFISICAL_CLIENT_ID_FILE: /run/secrets/infisical_client_id
+      INFISICAL_CLIENT_SECRET_FILE: /run/secrets/infisical_client_secret
+      INFISICAL_PROJECT_ID_FILE: /run/secrets/infisical_project_id
+      INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-prod}
+      INFISICAL_SECRET_PATH: ${INFISICAL_SECRET_PATH:-/}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
+
+secrets:
+  infisical_client_id:
+    file: ~/secrets/infisical/INFISICAL_CLIENT_ID
+  infisical_client_secret:
+    file: ~/secrets/infisical/INFISICAL_CLIENT_SECRET
+  infisical_project_id:
+    file: ~/secrets/infisical/INFISICAL_PROJECT_ID
