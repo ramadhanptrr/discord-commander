@@ -159,7 +159,7 @@ class OperatorOperations:
             if interaction.message is not None:
                 try:
                     await interaction.message.edit(
-                        embed=self._power_progress_embed(operation, "Memulai operasi..."),
+                        embed=self._power_progress_embed(operation, "Starting operation..."),
                         view=None,
                     )
                 except discord.DiscordException:
@@ -224,7 +224,7 @@ class OperatorOperations:
 
         embed = _timestamped_embed(
             title="🔴 NAS did not come online",
-            description="NAS tidak merespons dalam dua menit setelah Wake-on-LAN dikirim.",
+            description="NAS did not respond within two minutes after Wake-on-LAN was sent.",
             colour=discord.Colour.red(),
         )
         embed.set_footer(text="Wake NAS • Commander control room")
