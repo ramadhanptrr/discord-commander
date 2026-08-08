@@ -317,15 +317,72 @@ class OperatorOperations:
 
     async def _execute_shutdown(self, interaction: discord.Interaction) -> None:
         result = await asyncio.to_thread(self._nas.shutdown)
-        colour = discord.Colour.green() if result.success else discord.Colour.red()
-        title = "🟢 NAS shutdown command completed" if result.success else "🔴 NAS shutdown failed"
+        if not result.success:
+            await self._send_shutdown_result(
+                interaction,
+                title="🔴 NAS shutdown failed",
+                description="The graceful shutdown command did not complete.",
+                colour=discord.Colour.red(),
+                output=result.output,
+            )
+            return
 
-        if len(result.output) > _POWER_OUTPUT_LIMIT:
+        await interaction.edit_original_response(
+            content=None,
+            embed=self._power_progress_embed(
+                "shutdown", "Graceful shutdown command completed. Waiting for NAS to go offline..."
+            ),
+        )
+        start = asyncio.get_running_loop().time()
+        for attempt in range(1, 25):
+            await asyncio.sleep(5)
+            if not await asyncio.to_thread(self._nas.is_online):
+                elapsed = int(asyncio.get_running_loop().time() - start)
+                await self._send_shutdown_result(
+                    interaction,
+                    title="🟢 NAS offline",
+                    description=(
+                        "NAS stopped responding to the MikroTik reachability check after "
+                        f"approximately {elapsed} seconds."
+                    ),
+                    colour=discord.Colour.green(),
+                    output=result.output,
+                )
+                return
+
+            await interaction.edit_original_response(
+                content=None,
+                embed=self._power_progress_embed(
+                    "shutdown", f"Waiting for NAS shutdown... attempt {attempt}/24"
+                ),
+            )
+
+        await self._send_shutdown_result(
+            interaction,
+            title="🟠 NAS shutdown not confirmed",
+            description=(
+                "The graceful shutdown command completed, but the NAS still responded to the "
+                "MikroTik reachability check after two minutes."
+            ),
+            colour=discord.Colour.orange(),
+            output=result.output,
+        )
+
+    async def _send_shutdown_result(
+        self,
+        interaction: discord.Interaction,
+        *,
+        title: str,
+        description: str,
+        colour: discord.Colour,
+        output: str,
+    ) -> None:
+        if len(output) > _POWER_OUTPUT_LIMIT:
             attachment = discord.File(
-                io.BytesIO(result.output.encode("utf-8")),
+                io.BytesIO(output.encode("utf-8")),
                 filename="nas-shutdown.txt",
             )
-            description = "Operation output is attached as `nas-shutdown.txt`."
+            description += "\n\nOperation output is attached as `nas-shutdown.txt`."
             await interaction.edit_original_response(
                 content=None,
                 embed=_timestamped_embed(title=title, description=description, colour=colour),
@@ -335,7 +392,7 @@ class OperatorOperations:
 
         embed = _timestamped_embed(
             title=title,
-            description=_code_block(result.output),
+            description=f"{description}\n\n{_code_block(output)}",
             colour=colour,
         )
         embed.set_footer(text="Shutdown NAS • Commander control room")

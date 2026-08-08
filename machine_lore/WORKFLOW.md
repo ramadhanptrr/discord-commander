@@ -221,12 +221,15 @@ After the two-step confirmation and power lock:
 
 1. Commander SSHes directly to `NAS_IP` as `NAS_USER`.
 2. The remote command is the fixed `sudo NAS_SHUTDOWN_SCRIPT`.
-3. Commander returns the script output in an embed, or attaches it as `nas-shutdown.txt` when it is
-   longer than 3,000 characters.
-4. Commander releases the power lock.
+3. If the command succeeds, Commander waits five seconds, then checks NAS reachability through
+   MikroTik. It repeats for at most 24 attempts (roughly two minutes after the command completes).
+4. Commander reports **NAS offline** only when the NAS stops responding to the MikroTik check. If it
+   remains reachable, Commander reports that shutdown was not confirmed.
+5. Commander returns the script output in an embed, or attaches it as `nas-shutdown.txt` when it is
+   longer than 3,000 characters, then releases the power lock.
 
-The bot does not poll for the NAS to become offline after the script exits. The shutdown script is
-the authoritative implementation of a graceful shutdown.
+The offline result confirms loss of reachability from MikroTik; it is not a hardware power-sensor
+reading. The shutdown script remains the authoritative implementation of a graceful shutdown.
 
 ## 7. Automatic watchdogs
 
