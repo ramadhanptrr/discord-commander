@@ -70,8 +70,8 @@ delegates to a shared `OperatorOperations` method.
 
 | Command | Action | Output destination |
 |---|---|---|
-| `/start` | Posts a short welcome plus the control panel. | Control room |
-| `/panel` | Posts a new interactive control panel. | Control room |
+| `/start` | Posts the welcome control panel only if no stored panel exists. | Control room |
+| `/panel` | Creates one interactive control panel, or confirms the existing one. | Control room |
 | `/help` | Shows the supported command list. | Control room |
 | `/ping` | Replies `Pong!`. | Control room |
 | `/status nas` | Checks NAS reachability through MikroTik. | Control room |
@@ -85,8 +85,11 @@ There is no text-command parser and no message-content listener.
 
 ### 3.2 Persistent control panel
 
-`/start` and `/panel` create the same `CommanderPanel` with static component IDs. The bot registers
-one matching view at startup, allowing a previously sent panel to work after a container restart.
+`/start` and `/panel` share one `CommanderPanel` with static component IDs. The bot registers one
+matching view at startup, allowing a previously sent panel to work after a container restart. It
+stores the panel's control-room channel and message IDs in the mounted `commander_state` Docker
+volume; on startup it validates that saved message but never creates a panel automatically. A new
+panel is pinned when the bot has `Manage Messages`; a missing pin permission is only logged.
 
 | Row | Buttons | Behaviour |
 |---|---|---|
@@ -391,18 +394,21 @@ Smoke-test sequence:
 3. Confirm the bot appears online in each intended Discord guild and slash commands are visible in
    the control room.
 4. From an allowed user in the control room, use `/ping` and `/help`.
-5. Use `/panel`; click Ping, Help, Status NAS, Status Network, and Edge Info as appropriate for the
-   environment.
-6. Confirm command/button results appear in the control room, while no manual reply appears in the
+5. Use `/panel`; confirm one Commander panel is created and pinned when the bot has `Manage
+   Messages`.
+6. Restart the `commander` container. Without invoking `/panel`, click Ping or Status Network on the
+   original panel and confirm it still works.
+7. Invoke `/panel` again and confirm it sends only a private existing-panel confirmation. Delete the
+   panel, invoke `/panel`, and confirm a replacement is created and pinned.
+8. Confirm command/button results appear in the control room, while no manual reply appears in the
    watchdog channel.
-7. Confirm an unapproved user, wrong channel, or DM gets a private denial and cannot execute an
+9. Confirm an unapproved user, wrong channel, or DM gets a private denial and cannot execute an
    operation.
-8. Confirm `/wake nas` and `/shutdown nas` show a requester-bound 60-second confirmation. Exercise
+10. Confirm `/wake nas` and `/shutdown nas` show a requester-bound 60-second confirmation. Exercise
    actual power operations only in a safe maintenance window.
-9. Verify an automatic watchdog alert is delivered to the dedicated watchdog channel under a planned
+11. Verify an automatic watchdog alert is delivered to the dedicated watchdog channel under a planned
    test condition; do not use a production outage as the test procedure.
 
 The Docker image contains `openssh-client` and `iputils-ping`. If network status unexpectedly fails
 after an image rebuild, the focused diagnostic is `docker compose exec commander ping -c 1
 <MIKROTIK_HOST>` from the VPS.
-

@@ -24,7 +24,8 @@ injection path:
 - SSH endpoint identities are not pinned across connections.
 - The container sees the VPS account's entire SSH directory and runs as root.
 - The current rate limit protects power actions only.
-- Operational and monitor state is in memory and resets on restart.
+- Operational and monitor state is in memory and resets on restart; the Commander panel's
+  channel/message pointer is the exception and is persisted in the mounted Docker volume.
 - `infisicalsdk` is not version-pinned in `requirements.txt`.
 
 No critical repository-level issue was identified. The items below should be resolved or consciously
@@ -265,4 +266,3 @@ controls for a private automation service.
 Its remaining exposure is concentrated in SSH/deployment hardening and intentionally memory-only
 state. Treat the open findings as required operational follow-up, not as behaviour hidden by the
 Discord interface.
-

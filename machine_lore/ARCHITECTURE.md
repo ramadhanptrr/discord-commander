@@ -73,7 +73,8 @@ publishing it globally.
 |---|---|---|
 | `commander.bot.CommanderBot` | Discord client lifecycle, command registration/sync, channel validation, watchdog task lifecycle. | Config and task handles in process memory. |
 | `InteractionAuthorizer` | Requires allowed guild, control room, and user ID for every interaction. | Immutable config only. |
-| `CommanderPanel` | Persistent panel buttons with stable component IDs. | No application state; restored on startup. |
+| `CommanderPanel` | Persistent panel buttons with stable component IDs. | Restored on startup. |
+| `CommanderPanelStore` | Stores the single panel's channel/message IDs in the mounted Docker volume. | JSON pointer only; no secrets. |
 | `PowerConfirmationView` | 60-second, requester-bound confirmation controls. | Ephemeral in-memory view/message reference. |
 | `OperatorOperations` | Shared command/button responses and power workflows. | References controllers, limiter, power lock, network watchdog. |
 | `MikroTikClient` | Fixed RouterOS ping and WoL SSH commands. | Immutable config. |
@@ -206,4 +207,3 @@ outage from the restarted process if the network is still unreachable.
 
 Keep operational values in their owning system. Do not copy bot tokens, SSH private keys, Discord
 IDs, or current host details into this documentation.
-

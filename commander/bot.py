@@ -18,6 +18,7 @@ from commander.netmonitor import NetworkWatchdog
 from commander.network import NetworkChecker
 from commander.notifier import DiscordWatchdogNotifier
 from commander.operations import OperatorOperations
+from commander.panel_state import CommanderPanelLocation, CommanderPanelStore
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
 from commander.ui.panel import CommanderPanel, build_panel_embed
@@ -128,6 +129,8 @@ class CommanderBot(commands.Bot):
         self._operations.set_network_watchdog(self._network_watchdog)
         self._network_watchdog_task: asyncio.Task[None] | None = None
         self._nas_uptime_watchdog_task: asyncio.Task[None] | None = None
+        self._panel_store = CommanderPanelStore()
+        self._panel_lock = asyncio.Lock()
         self._guilds = [discord.Object(id=guild_id) for guild_id in config.discord.guild_ids]
 
         self.tree.add_command(
@@ -182,7 +185,9 @@ class CommanderBot(commands.Bot):
     async def setup_hook(self) -> None:
         # Static component IDs let an existing panel survive a container restart.
         self.add_view(CommanderPanel(self._authorizer, self._operations))
+        logger.info("Persistent Commander panel view registered")
         await self._validate_configured_channels()
+        await self._recover_stored_panel()
 
         for guild in self._guilds:
             synced = await self.tree.sync(guild=guild)
@@ -220,20 +225,196 @@ class CommanderBot(commands.Bot):
     async def show_panel(self, interaction: discord.Interaction) -> None:
         if not await self._authorizer.require_operator(interaction):
             return
-        await self._send_panel(interaction)
+        await self._ensure_panel(interaction)
 
     async def show_start(self, interaction: discord.Interaction) -> None:
         if not await self._authorizer.require_operator(interaction):
             return
-        await self._send_panel(interaction, content="🤖 Discord Commander is active.")
+        await self._ensure_panel(interaction, content="🤖 Discord Commander is active.")
 
-    async def _send_panel(self, interaction: discord.Interaction, content: str | None = None) -> None:
-        await interaction.response.send_message(
-            content=content,
-            embed=build_panel_embed(),
-            view=CommanderPanel(self._authorizer, self._operations),
-            ephemeral=False,
-        )
+    async def _recover_stored_panel(self) -> None:
+        """Check the saved panel at startup without creating a replacement."""
+        panel, unavailable = await self._find_stored_panel()
+        if panel is not None:
+            logger.info(
+                "Existing Commander panel found: channel=%s message=%s",
+                panel.channel.id,
+                panel.id,
+            )
+        elif unavailable:
+            logger.warning("Could not validate the stored Commander panel during startup")
+
+    async def _ensure_panel(
+        self, interaction: discord.Interaction, content: str | None = None
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        async with self._panel_lock:
+            existing_panel, unavailable = await self._find_stored_panel()
+            if existing_panel is not None:
+                logger.info(
+                    "Existing Commander panel found: channel=%s message=%s",
+                    existing_panel.channel.id,
+                    existing_panel.id,
+                )
+                await interaction.followup.send(
+                    "The Commander panel is already available in this control room.",
+                    ephemeral=True,
+                )
+                return
+
+            if unavailable:
+                await interaction.followup.send(
+                    "I could not verify the existing Commander panel. Check the bot's channel "
+                    "permissions before creating another one.",
+                    ephemeral=True,
+                )
+                return
+
+            channel = interaction.channel
+            if not isinstance(channel, discord.abc.Messageable):
+                logger.warning("Commander panel could not be created: control-room channel is unavailable")
+                await interaction.followup.send(
+                    "I could not access this control-room channel to create the panel.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                panel = await channel.send(
+                    content=content,
+                    embed=build_panel_embed(),
+                    view=CommanderPanel(self._authorizer, self._operations),
+                )
+            except discord.Forbidden:
+                logger.warning("Commander panel could not be created: missing channel permissions")
+                await interaction.followup.send(
+                    "I do not have permission to create the Commander panel in this channel.",
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException:
+                logger.exception("Discord API error while creating Commander panel")
+                await interaction.followup.send(
+                    "Discord could not create the Commander panel. Please try again later.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                self._panel_store.save(
+                    CommanderPanelLocation(channel_id=panel.channel.id, message_id=panel.id)
+                )
+            except OSError:
+                logger.exception("Commander panel was created but its location could not be saved")
+                persistence_message = (
+                    " The panel was created, but its location could not be saved for restart recovery."
+                )
+            else:
+                logger.info(
+                    "Commander panel created: channel=%s message=%s", panel.channel.id, panel.id
+                )
+                persistence_message = ""
+
+            await self._pin_panel(panel)
+            await interaction.followup.send(
+                f"Commander panel created.{persistence_message}", ephemeral=True
+            )
+
+    async def _find_stored_panel(self) -> tuple[discord.Message | None, bool]:
+        """Return ``(panel, unavailable)`` so API failures never cause a duplicate panel."""
+        location = self._panel_store.load()
+        if location is None:
+            return None, False
+
+        if location.channel_id != self._config.discord.control_room_channel_id:
+            logger.warning(
+                "Stored Commander panel channel=%s does not match the configured control room=%s",
+                location.channel_id,
+                self._config.discord.control_room_channel_id,
+            )
+            self._clear_stored_panel()
+            return None, False
+
+        try:
+            channel = await self.fetch_channel(location.channel_id)
+        except discord.NotFound:
+            logger.warning("Stored Commander panel channel missing: channel=%s", location.channel_id)
+            self._clear_stored_panel()
+            return None, False
+        except discord.Forbidden:
+            logger.warning("Cannot view stored Commander panel channel: channel=%s", location.channel_id)
+            return None, True
+        except discord.HTTPException:
+            logger.exception(
+                "Discord API error while fetching stored Commander panel channel=%s", location.channel_id
+            )
+            return None, True
+
+        if not isinstance(channel, discord.abc.Messageable):
+            logger.warning(
+                "Stored Commander panel channel cannot fetch messages: channel=%s", location.channel_id
+            )
+            return None, True
+
+        try:
+            panel = await channel.fetch_message(location.message_id)
+        except discord.NotFound:
+            logger.warning(
+                "Stored Commander panel message missing: channel=%s message=%s",
+                location.channel_id,
+                location.message_id,
+            )
+            self._clear_stored_panel()
+            return None, False
+        except discord.Forbidden:
+            logger.warning(
+                "Cannot view stored Commander panel message: channel=%s message=%s",
+                location.channel_id,
+                location.message_id,
+            )
+            return None, True
+        except discord.HTTPException:
+            logger.exception(
+                "Discord API error while fetching stored Commander panel: channel=%s message=%s",
+                location.channel_id,
+                location.message_id,
+            )
+            return None, True
+
+        if self.user is not None and panel.author.id != self.user.id:
+            logger.warning(
+                "Stored Commander panel message is not owned by this bot: channel=%s message=%s",
+                location.channel_id,
+                location.message_id,
+            )
+            self._clear_stored_panel()
+            return None, False
+
+        return panel, False
+
+    def _clear_stored_panel(self) -> None:
+        try:
+            self._panel_store.clear()
+        except OSError:
+            logger.exception("Could not clear missing Commander panel state")
+
+    async def _pin_panel(self, panel: discord.Message) -> None:
+        try:
+            await panel.pin(reason="Commander persistent control panel")
+        except discord.Forbidden:
+            logger.warning(
+                "Failed to pin Commander panel: missing Manage Messages permission "
+                "(channel=%s message=%s)",
+                panel.channel.id,
+                panel.id,
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to pin Commander panel: channel=%s message=%s", panel.channel.id, panel.id
+            )
+        else:
+            logger.info("Commander panel pinned: channel=%s message=%s", panel.channel.id, panel.id)
 
     async def ping(self, interaction: discord.Interaction) -> None:
         if await self._authorizer.require_operator(interaction):
