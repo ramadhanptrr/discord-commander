@@ -44,15 +44,13 @@ are posted publicly in that control room so the operator history remains visible
 | `/edge info` | Edge Info | Runs the fixed `EDGE_INFO_SCRIPT` through SSH and returns its output. |
 | `/wake nas` | Wake NAS | Shows a 60-second confirmation, sends Wake-on-LAN through MikroTik, then waits up to two minutes for the NAS. |
 | `/shutdown nas` | Shutdown NAS | Shows a 60-second confirmation, then runs the fixed graceful shutdown script through SSH. |
-| `/panel` | — | Creates the persistent interactive control panel once, or locates the existing panel. |
-| `/start` | — | Posts the welcome panel only when no Commander panel exists yet. |
+| `/panel` | — | Posts the persistent interactive control panel. |
+| `/start` | — | Posts the welcome message and the same control panel. |
 | `/help` | Help | Lists all supported commands. |
 
 The panel has persistent component IDs, so a panel message remains usable after a container restart
-as long as the bot comes back with the same code. Its channel/message IDs are stored in the Docker
-named volume `commander_state`; `/panel` checks that message before creating another one. New panels
-are pinned when the bot has permission. Power-confirmation buttons are intentionally short-lived and
-expire after 60 seconds.
+as long as the bot comes back with the same code. Power-confirmation buttons are intentionally
+short-lived and expire after 60 seconds.
 
 ### Automatic watchdog alerts
 
@@ -72,9 +70,8 @@ control room and, when an outage is already tracked, includes the current watchd
 Install the bot in every guild listed by `DISCORD_GUILD_IDS` with the `bot` and
 `applications.commands` scopes. The bot needs access to both configured channels:
 
-- **Control room:** View Channel, Read Message History, Send Messages, Embed Links, Attach Files,
-  and permission to use application-command interactions. Grant **Manage Messages** too if the bot
-  should pin the Commander panel automatically.
+- **Control room:** View Channel, Send Messages, Embed Links, Attach Files, and permission to use
+  application-command interactions.
 - **Watchdog channel:** View Channel, Send Messages, and Embed Links.
 
 The application intentionally does not read normal Discord messages. It uses guild-scoped slash
