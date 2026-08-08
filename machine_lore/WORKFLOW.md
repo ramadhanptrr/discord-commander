@@ -204,12 +204,14 @@ error embed.
 
 After the two-step confirmation and power lock:
 
-1. Commander SSHes to MikroTik and runs the fixed RouterOS Wake-on-LAN operation using `NAS_MAC` and
-   `NAS_WOL_INTERFACE`.
-2. If the WoL command succeeds, Commander reports progress in the same interaction response.
-3. It waits five seconds, then performs a MikroTik-mediated NAS status check.
-4. It repeats for at most 24 attempts (roughly two minutes after the packet was sent).
-5. It reports success with approximate elapsed boot time, or a timeout if NAS did not answer.
+1. Commander first asks MikroTik whether the NAS is already reachable. If it is, Commander reports
+   **NAS already online** and does not send a Wake-on-LAN packet.
+2. Otherwise, Commander SSHes to MikroTik and runs the fixed RouterOS Wake-on-LAN operation using
+   `NAS_MAC` and `NAS_WOL_INTERFACE`.
+3. If the WoL command succeeds, Commander reports progress in the same interaction response.
+4. It waits five seconds, then performs a MikroTik-mediated NAS status check.
+5. It repeats for at most 24 attempts (roughly two minutes after the packet was sent).
+6. It reports success with approximate elapsed boot time, or a timeout if NAS did not answer.
 
 WoL only requests wake-up; a successful RouterOS command is not proof that the NAS later booted.
 

@@ -42,7 +42,7 @@ are posted publicly in that control room so the operator history remains visible
 | `/status nas` | Status NAS | Asks MikroTik to check NAS reachability. |
 | `/status net` | Status Network | Runs an ICMP probe from the container to the home gateway. |
 | `/edge info` | Edge Info | Runs the fixed `EDGE_INFO_SCRIPT` through SSH and returns its output. |
-| `/wake nas` | Wake NAS | Shows a 60-second confirmation, sends Wake-on-LAN through MikroTik, then waits up to two minutes for the NAS. |
+| `/wake nas` | Wake NAS | Shows a 60-second confirmation, reports when the NAS is already online, or sends Wake-on-LAN through MikroTik and waits up to two minutes for it. |
 | `/shutdown nas` | Shutdown NAS | Shows a 60-second confirmation, then runs the fixed graceful shutdown script through SSH. |
 | `/panel` | — | Posts the persistent interactive control panel. |
 | `/start` | — | Posts the welcome message and the same control panel. |

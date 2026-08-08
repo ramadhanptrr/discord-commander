@@ -255,6 +255,23 @@ class OperatorOperations:
             await self._power_state.release(operation)
 
     async def _execute_wake(self, interaction: discord.Interaction) -> None:
+        await interaction.edit_original_response(
+            content=None,
+            embed=self._power_progress_embed("wake", "Checking whether the NAS is already online..."),
+        )
+        if await asyncio.to_thread(self._nas.is_online):
+            embed = _timestamped_embed(
+                title="🟢 NAS already online",
+                description=(
+                    "Wake-on-LAN was not sent because the NAS already responded to the "
+                    "MikroTik reachability check."
+                ),
+                colour=discord.Colour.green(),
+            )
+            embed.set_footer(text="Wake NAS • Commander control room")
+            await interaction.edit_original_response(content=None, embed=embed)
+            return
+
         result = await asyncio.to_thread(self._nas.wake)
         if not result.success:
             embed = _timestamped_embed(
