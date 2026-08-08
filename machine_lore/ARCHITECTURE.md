@@ -55,7 +55,7 @@ Allowed user + allowed guild + Control room
   -> public manual operation results in the same control room
 
 Watchdog channel
-  -> automatic network DOWN/RECOVERED and NAS uptime reminders only
+  -> automatic Commander-started, network DOWN/RECOVERED, and NAS-uptime notifications only
   -> no commands, no buttons, no manual replies
 ```
 

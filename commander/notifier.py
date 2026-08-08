@@ -6,7 +6,7 @@ from commander.netmonitor import format_duration
 
 
 class DiscordWatchdogNotifier:
-    """Sends autonomous network-monitor alerts to the dedicated watchdog channel only."""
+    """Sends autonomous Commander notifications to the dedicated watchdog channel only."""
 
     def __init__(self, bot: discord.Client, watchdog_channel_id: int, interval_seconds: int) -> None:
         self._bot = bot
@@ -20,6 +20,19 @@ class DiscordWatchdogNotifier:
         if not isinstance(channel, discord.abc.Messageable):
             raise RuntimeError("Configured watchdog channel does not accept messages")
         return channel
+
+    async def send_commander_started(self) -> None:
+        embed = discord.Embed(
+            title="🟢 Commander online",
+            description="Discord Commander started and is ready for control-room operations.",
+            colour=discord.Colour.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text="Commander lifecycle • Automatic notification")
+        await (await self._channel()).send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def send_network_down(self, host: str, checks: list[str]) -> None:
         embed = discord.Embed(

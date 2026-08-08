@@ -59,6 +59,7 @@ receives panel buttons or ordinary command replies.
 
 | Watchdog | Destination | Behaviour |
 |---|---|---|
+| Commander startup | `DISCORD_WATCHDOG_CHANNEL_ID` | Sends one **Commander online** notification after each newly started bot process connects to Discord. A reconnect does not send a duplicate. |
 | Home network | `DISCORD_WATCHDOG_CHANNEL_ID` | Sends one **DOWN** alert after configured failed/confirmed probes, then one **RECOVERED** alert when the gateway answers again. It stays quiet while the state is unchanged. |
 | NAS uptime | `DISCORD_WATCHDOG_CHANNEL_ID` | Reminds operators when the NAS remains online longer than `NAS_MAX_AGE_MINUTE`, then repeats at `NAS_MAX_AGE_REMINDER_MINUTE` intervals while it remains online. |
 

@@ -105,6 +105,7 @@ class CommanderBot(commands.Bot):
             config.discord.watchdog_channel_id,
             config.network.watchdog_interval_seconds,
         )
+        self._watchdog_notifier = watchdog_notifier
         nas = NasController(config.nas, mikrotik)
         self._operations = OperatorOperations(
             config,
@@ -128,6 +129,8 @@ class CommanderBot(commands.Bot):
         self._operations.set_network_watchdog(self._network_watchdog)
         self._network_watchdog_task: asyncio.Task[None] | None = None
         self._nas_uptime_watchdog_task: asyncio.Task[None] | None = None
+        self._startup_notification_sent = False
+        self._startup_notification_lock = asyncio.Lock()
         self._guilds = [discord.Object(id=guild_id) for guild_id in config.discord.guild_ids]
 
         self.tree.add_command(
@@ -253,6 +256,22 @@ class CommanderBot(commands.Bot):
             self._nas_uptime_watchdog_task = asyncio.create_task(
                 self._nas_uptime_watchdog.run(), name="nas-uptime-watchdog"
             )
+        await self._notify_startup_once()
+
+    async def _notify_startup_once(self) -> None:
+        """Notify the watchdog channel once for each newly started Commander process."""
+        async with self._startup_notification_lock:
+            if self._startup_notification_sent:
+                return
+
+            try:
+                await self._watchdog_notifier.send_commander_started()
+            except Exception:
+                logger.exception("Could not send Commander startup notification to watchdog channel")
+                return
+
+            self._startup_notification_sent = True
+            logger.info("Sent Commander startup notification to watchdog channel")
 
     async def close(self) -> None:
         watchdog_tasks = (

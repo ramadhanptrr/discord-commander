@@ -29,7 +29,7 @@ main()
        -> register guild slash-command groups and persistent panel view
   -> Bot.run()
        -> setup_hook(): validate configured Discord channels; sync commands to every allowed guild
-       -> on_ready(): start network and NAS-uptime watchdog tasks
+       -> on_ready(): start network and NAS-uptime watchdog tasks; send one startup notification
        -> Discord gateway: slash commands and button interactions
 ```
 
@@ -58,8 +58,11 @@ globally.
 Channel validation fails startup if either channel cannot be fetched, lies outside the allowed guild
 set, cannot receive messages, or if control room and watchdog channel use the same ID.
 
-`on_ready()` starts each watchdog once. `close()` cancels and awaits both tasks before closing the
-Discord client. A reconnect does not create duplicate watchdog tasks.
+`on_ready()` starts each watchdog once and sends one **Commander online** notification to the
+watchdog channel for the process lifetime. The in-memory startup flag prevents Discord reconnects
+from sending duplicate startup notifications; a new container/process has fresh memory and sends a
+new notification after it connects. `close()` cancels and awaits both watchdog tasks before closing
+the Discord client.
 
 ## 3. Discord entry points
 
@@ -126,8 +129,9 @@ Accepted manual results are public in the control room (`ephemeral=False`) so op
 operation history. Unhandled application-command errors are logged and receive an ephemeral generic
 response. The watchdog channel receives no manual messages.
 
-`DISCORD_WATCHDOG_CHANNEL_ID` is used exclusively by background watchdog notifications. Its alerts
-contain no interactive buttons and mention nobody (`AllowedMentions.none()`).
+`DISCORD_WATCHDOG_CHANNEL_ID` is used exclusively by automatic lifecycle and watchdog
+notifications. Its alerts contain no interactive buttons and mention nobody
+(`AllowedMentions.none()`).
 
 ## 5. Rate limiting and concurrency state
 
