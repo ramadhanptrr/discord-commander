@@ -271,19 +271,63 @@ def load_turso_config() -> TursoConfig:
     )
 
 
-def load_config(turso: ConfigSource) -> Config:
-    """Build immutable runtime configuration. No secret values are logged.
-
-    Discord and MikroTik identity still come from Infisical. Edge, NAS, and home-network
-    operational values (including the shared SSH key path) come from the Turso local replica in
-    ``turso``, which must already be bootstrapped by the caller before this runs.
-    """
-    v = _infisical_values()
-    edge = _group_values(turso.read_group("edge"))
-    nas = _group_values(turso.read_group("nas"))
+def _ssh_key_path(turso: ConfigSource) -> str | None:
     home_network = _group_values(turso.read_group("home_network"))
+    return home_network.optional("SSH_KEY_PATH") or None
 
-    ssh_key_path = home_network.optional("SSH_KEY_PATH") or None
+
+def load_edge_config(turso: ConfigSource) -> EdgeConfig:
+    """Read the ``edge`` group fresh from the local replica. Safe to call on every action."""
+    edge = _group_values(turso.read_group("edge"))
+    return EdgeConfig(
+        internal_ip=edge.host("EDGE_INTERNAL_IP"),
+        ssh_port=edge.positive_int("EDGE_SSH_PORT", default=22),
+        ssh_user=edge.ssh_username("EDGE_SSH_USER"),
+        info_script=edge.script_path("EDGE_INFO_SCRIPT"),
+    )
+
+
+def load_mikrotik_config(turso: ConfigSource) -> MikroTikConfig:
+    """Read MikroTik identity (Infisical) plus the shared SSH key path (Turso), fresh each call."""
+    v = _infisical_values()
+    return MikroTikConfig(
+        host=v.host("MIKROTIK_HOST"),
+        port=v.positive_int("MIKROTIK_PORT", default=22),
+        username=v.ssh_username("MIKROTIK_USERNAME"),
+        ssh_key_path=_ssh_key_path(turso),
+    )
+
+
+def load_nas_config(turso: ConfigSource) -> NasConfig:
+    """Read the ``nas`` group (plus the shared SSH key path) fresh. Safe to call on every action."""
+    nas = _group_values(turso.read_group("nas"))
+    return NasConfig(
+        ip=nas.host("NAS_IP"),
+        mac=nas.mac_address("NAS_MAC"),
+        wol_interface=nas.router_interface("NAS_WOL_INTERFACE"),
+        ssh_host=nas.host("NAS_IP"),
+        ssh_port=nas.positive_int("NAS_SSH_PORT", default=22),
+        ssh_user=nas.ssh_username("NAS_USER"),
+        shutdown_script=nas.script_path("NAS_SHUTDOWN_SCRIPT"),
+        uptime_script=nas.script_path("NAS_UPTIME_SCRIPT"),
+        ssh_key_path=_ssh_key_path(turso),
+    )
+
+
+def load_nas_watchdog_config(turso: ConfigSource) -> NasWatchdogConfig:
+    """Read the NAS watchdog timing values fresh. Called on every watchdog tick."""
+    nas = _group_values(turso.read_group("nas"))
+    return NasWatchdogConfig(
+        check_interval_seconds=nas.positive_int("NAS_MONITOR_INTERVAL", default=60),
+        max_age_seconds=nas.positive_int("NAS_MAX_AGE_MINUTE") * 60,
+        reminder_interval_seconds=nas.positive_int("NAS_MAX_AGE_REMINDER_MINUTE") * 60,
+    )
+
+
+def load_network_config(turso: ConfigSource) -> NetworkConfig:
+    """Read the ``home_network`` group (plus the Infisical gateway host) fresh each call."""
+    v = _infisical_values()
+    home_network = _group_values(turso.read_group("home_network"))
 
     anchor_raw = home_network.optional("NETWORK_ANCHOR_HOST")
     anchor_host = None
@@ -292,6 +336,30 @@ def load_config(turso: ConfigSource) -> Config:
             raise RuntimeError("Secret NETWORK_ANCHOR_HOST must be a safe hostname or IP address")
         anchor_host = anchor_raw
 
+    return NetworkConfig(
+        host=v.host("MIKROTIK_HOST"),
+        manual_probe_count=home_network.positive_int("NETWORK_RECOVERY_PING_COUNT", default=5),
+        ping_timeout_seconds=home_network.positive_int("NETWORK_PING_TIMEOUT", default=3),
+        watchdog_interval_seconds=home_network.positive_int("TIMED_OUT_INTERVAL", default=10) * 60,
+        watchdog_probe_count=home_network.positive_int("NETWORK_PING_COUNT", default=10),
+        watchdog_recovery_probe_count=home_network.positive_int(
+            "NETWORK_RECOVERY_PING_COUNT", default=5
+        ),
+        anchor_host=anchor_host,
+        confirm_delay_seconds=home_network.non_negative_int("NETWORK_CONFIRM_DELAY", default=15),
+    )
+
+
+def load_config(turso: ConfigSource) -> Config:
+    """Build the startup configuration snapshot. No secret values are logged.
+
+    Used once at process start (channel validation, Discord/MikroTik identity, initial watchdog
+    interval for cosmetic display). Edge, NAS, and home-network operational values are re-read
+    live from the Turso replica on every action instead of being held from this snapshot -- see
+    ``load_edge_config``/``load_mikrotik_config``/``load_nas_config``/``load_nas_watchdog_config``/
+    ``load_network_config``.
+    """
+    v = _infisical_values()
     return Config(
         discord=DiscordConfig(
             bot_token=v.required("DISCORD_BOT_TOKEN"),
@@ -300,44 +368,9 @@ def load_config(turso: ConfigSource) -> Config:
             watchdog_channel_id=v.positive_int("DISCORD_WATCHDOG_CHANNEL_ID"),
             allowed_user_ids=v.snowflake_list("DISCORD_ALLOWED_USER_IDS"),
         ),
-        edge=EdgeConfig(
-            internal_ip=edge.host("EDGE_INTERNAL_IP"),
-            ssh_port=edge.positive_int("EDGE_SSH_PORT", default=22),
-            ssh_user=edge.ssh_username("EDGE_SSH_USER"),
-            info_script=edge.script_path("EDGE_INFO_SCRIPT"),
-        ),
-        mikrotik=MikroTikConfig(
-            host=v.host("MIKROTIK_HOST"),
-            port=v.positive_int("MIKROTIK_PORT", default=22),
-            username=v.ssh_username("MIKROTIK_USERNAME"),
-            ssh_key_path=ssh_key_path,
-        ),
-        nas=NasConfig(
-            ip=nas.host("NAS_IP"),
-            mac=nas.mac_address("NAS_MAC"),
-            wol_interface=nas.router_interface("NAS_WOL_INTERFACE"),
-            ssh_host=nas.host("NAS_IP"),
-            ssh_port=nas.positive_int("NAS_SSH_PORT", default=22),
-            ssh_user=nas.ssh_username("NAS_USER"),
-            shutdown_script=nas.script_path("NAS_SHUTDOWN_SCRIPT"),
-            uptime_script=nas.script_path("NAS_UPTIME_SCRIPT"),
-            ssh_key_path=ssh_key_path,
-        ),
-        nas_watchdog=NasWatchdogConfig(
-            check_interval_seconds=nas.positive_int("NAS_MONITOR_INTERVAL", default=60),
-            max_age_seconds=nas.positive_int("NAS_MAX_AGE_MINUTE") * 60,
-            reminder_interval_seconds=nas.positive_int("NAS_MAX_AGE_REMINDER_MINUTE") * 60,
-        ),
-        network=NetworkConfig(
-            host=v.host("MIKROTIK_HOST"),
-            manual_probe_count=home_network.positive_int("NETWORK_RECOVERY_PING_COUNT", default=5),
-            ping_timeout_seconds=home_network.positive_int("NETWORK_PING_TIMEOUT", default=3),
-            watchdog_interval_seconds=home_network.positive_int("TIMED_OUT_INTERVAL", default=10) * 60,
-            watchdog_probe_count=home_network.positive_int("NETWORK_PING_COUNT", default=10),
-            watchdog_recovery_probe_count=home_network.positive_int(
-                "NETWORK_RECOVERY_PING_COUNT", default=5
-            ),
-            anchor_host=anchor_host,
-            confirm_delay_seconds=home_network.non_negative_int("NETWORK_CONFIRM_DELAY", default=15),
-        ),
+        edge=load_edge_config(turso),
+        mikrotik=load_mikrotik_config(turso),
+        nas=load_nas_config(turso),
+        nas_watchdog=load_nas_watchdog_config(turso),
+        network=load_network_config(turso),
     )

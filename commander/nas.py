@@ -4,7 +4,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 
-from commander.config import NasConfig
+from commander.config import ConfigSource, load_nas_config
 from commander.mikrotik import MikroTikClient
 
 
@@ -18,25 +18,29 @@ class NasOperationResult:
 
 
 class NasController:
-    """NAS power operations backed by fixed Infisical configuration only."""
+    """NAS power operations. Reads the ``nas`` group fresh from Turso on every call, so a Turso
+    edit applies to the next action without a Commander restart."""
 
-    def __init__(self, config: NasConfig, mikrotik: MikroTikClient) -> None:
-        self._config = config
+    def __init__(self, turso: ConfigSource, mikrotik: MikroTikClient) -> None:
+        self._turso = turso
         self._mikrotik = mikrotik
 
     def is_online(self) -> bool:
-        return self._mikrotik.ping(self._config.ip)
+        config = load_nas_config(self._turso)
+        return self._mikrotik.ping(config.ip)
 
     def wake(self) -> NasOperationResult:
+        config = load_nas_config(self._turso)
         success, error = self._mikrotik.send_wol(
-            mac=self._config.mac,
-            interface=self._config.wol_interface,
+            mac=config.mac,
+            interface=config.wol_interface,
         )
         if success:
             return NasOperationResult(True, "Wake-on-LAN packet sent.")
         return NasOperationResult(False, error or "Wake-on-LAN request failed.")
 
     def shutdown(self) -> NasOperationResult:
+        config = load_nas_config(self._turso)
         ssh_command = [
             "ssh",
             "-o",
@@ -44,14 +48,14 @@ class NasController:
             "-o",
             "UserKnownHostsFile=/dev/null",
             "-p",
-            str(self._config.ssh_port),
+            str(config.ssh_port),
         ]
-        if self._config.ssh_key_path:
-            ssh_command.extend(["-i", self._config.ssh_key_path])
+        if config.ssh_key_path:
+            ssh_command.extend(["-i", config.ssh_key_path])
         ssh_command.extend(
             [
-                f"{self._config.ssh_user}@{self._config.ssh_host}",
-                f"sudo {self._config.shutdown_script}",
+                f"{config.ssh_user}@{config.ssh_host}",
+                f"sudo {config.shutdown_script}",
             ]
         )
 
@@ -78,6 +82,7 @@ class NasController:
 
     def get_boot_epoch(self) -> int | None:
         """Run the fixed unprivileged uptime script and return its Unix boot timestamp."""
+        config = load_nas_config(self._turso)
         ssh_command = [
             "ssh",
             "-o",
@@ -87,14 +92,14 @@ class NasController:
             "-o",
             "ConnectTimeout=10",
             "-p",
-            str(self._config.ssh_port),
+            str(config.ssh_port),
         ]
-        if self._config.ssh_key_path:
-            ssh_command.extend(["-i", self._config.ssh_key_path])
+        if config.ssh_key_path:
+            ssh_command.extend(["-i", config.ssh_key_path])
         ssh_command.extend(
             [
-                f"{self._config.ssh_user}@{self._config.ssh_host}",
-                self._config.uptime_script,
+                f"{config.ssh_user}@{config.ssh_host}",
+                config.uptime_script,
             ]
         )
 

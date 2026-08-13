@@ -27,10 +27,12 @@ main()
   -> load_turso_config() from Infisical (Turso URL/token/sync intervals)
   -> TursoCacheManager.bootstrap(): delete any existing local replica, pull a fresh one from
      Turso Cloud (fails startup on error/timeout)
-  -> load_config(turso_cache) from Infisical (Discord, MikroTik) + the fresh Turso replica
-     (edge, NAS, home-network values)
+  -> load_config(turso_cache): a one-time startup snapshot for Discord identity, MikroTik
+     identity, and channel validation (edge/NAS/home-network values are NOT held from this
+     snapshot -- see below)
   -> CommanderBot(config, turso_cache)
-       -> build authorization, controllers, state, limiter, and watchdogs
+       -> build authorization, controllers, state, limiter, and watchdogs -- each controller and
+          watchdog is handed the `TursoCacheManager` (a `ConfigSource`) itself, not a config value
        -> attach the watchdog notifier to the Turso cache manager
        -> register guild slash-command groups and persistent panel view
   -> Bot.run()
@@ -40,11 +42,19 @@ main()
        -> Discord gateway: slash commands and button interactions
 ```
 
-Configuration is read once when the process starts, from a Turso replica that is itself rebuilt
-fresh on every startup. A Turso or Infisical change therefore requires a container restart before
-the running controllers use it. The Turso periodic sync task keeps the *local replica file* current
-and drives DOWN/RECOVERED health alerts, but it does not hot-reload already-running controllers —
-see [§9.2a](#92a-turso-connection-and-sync-values-infisical).
+Discord identity (bot token, guild/channel/user IDs) and MikroTik host/port/username come from
+Infisical and are read once at startup into an immutable `Config` snapshot, so changing those still
+requires a container restart. Edge, NAS, and home-network values (including the shared SSH key path)
+are the opposite: every command and every watchdog tick calls `load_edge_config()` /
+`load_nas_config()` / `load_nas_watchdog_config()` / `load_network_config()` /
+`load_mikrotik_config()` (for the shared SSH key path) fresh against the local Turso replica file at
+the moment it runs. There is no in-memory copy of these values between actions. A value edited in
+Turso Cloud applies on the *next* action once the periodic sync (or a restart's fresh bootstrap) has
+pulled it into the local replica file -- no restart is needed for these groups. If a value is
+missing or fails validation at the moment an action reads it, that single action fails (command:
+a Discord error reply via the existing generic exception handling in `operations.py`; watchdog
+tick: logged and retried after a 60-second backoff) rather than crashing the process -- see
+[§9.2a](#92a-turso-connection-and-sync-values-infisical) and [§7.3](#73-turso-synchronization-watchdog).
 
 ## 2. Startup, command registration, and shutdown
 
@@ -56,11 +66,13 @@ Turso bootstrap, and invalid Turso-sourced values all stop startup without loggi
 `CommanderBot` then creates the following process-local components:
 
 - `InteractionAuthorizer` for all slash commands and component clicks;
-- `MikroTikClient`, `NasController`, and `EdgeController` for fixed SSH operations;
-- `NetworkChecker` for direct container ICMP probes;
+- `MikroTikClient`, `NasController`, and `EdgeController` for fixed SSH operations -- each holds
+  the `TursoCacheManager` itself and reads its config group fresh on every call, not a config value;
+- `NetworkChecker` for direct container ICMP probes, same live-read pattern;
 - `PowerOperationState` to make wake and shutdown mutually exclusive;
 - `RateLimiter` for confirmed power actions;
-- `NetworkWatchdog` and `NasUptimeWatchdog` with a shared Discord notifier;
+- `NetworkWatchdog` and `NasUptimeWatchdog` with a shared Discord notifier -- both re-read their
+  config (including their own tick interval) at the top of every tick;
 - a `TursoCacheManager` reference (already bootstrapped in `main()`), with the same Discord
   notifier attached for DOWN/RECOVERED alerts.
 
@@ -320,12 +332,16 @@ every TURSO_DB_SYNC_INTERVAL minutes
           elapsed since the last DOWN/reminder alert; otherwise stay silent
 ```
 
-A sync failure never stops Commander and never deletes the local replica: business modules keep
-reading the configuration snapshot that was already materialized into `Config` at startup (see §1).
-The sync task exists to (a) keep the on-disk replica fresh for the *next* container restart's fresh
-bootstrap, and (b) alert operators when Turso Cloud itself is unreachable. It does not hot-reload
-`EdgeConfig`/`NasConfig`/`NetworkConfig` values into the running process — that still requires a
-restart, same as the pre-Turso Infisical-only design (`AUDIT.md` CFG-01).
+A sync failure never stops Commander and never deletes the local replica: `read_group()` calls made
+by an in-flight action keep returning whatever the local replica file currently holds (see §1). The
+sync task exists to (a) keep the on-disk replica fresh so every subsequent `load_edge_config()` /
+`load_nas_config()` / `load_network_config()` call (and the *next* container restart's fresh
+bootstrap) sees current data, and (b) alert operators when Turso Cloud itself is unreachable. Since
+`EdgeConfig`/`NasConfig`/`NetworkConfig` values are read fresh on every action rather than held in
+`Config` after startup, a Turso Cloud edit applies as soon as the periodic sync has pulled it in --
+no restart required. Discord identity and MikroTik host/port/username (Infisical) are the exception:
+those are still read once into `Config` at startup and do require a restart (`AUDIT.md` CFG-01
+describes the pre-Turso version of this restart requirement).
 
 ## 8. SSH execution and output rules
 
@@ -389,9 +405,10 @@ rather than living inside the data they are used to fetch (`commander/config.py:
 ### 9.3 Device and operation values
 
 MikroTik identity stays on Infisical (it is the SSH target used to reach the rest of the home
-network, not itself managed through Turso). Edge, NAS, and home-network values come from the
-Turso replica, read once at startup via `TursoCacheManager.read_group(identifier)` from the
-`master_configurations` table, grouped by the `identifier` column shown below.
+network, not itself managed through Turso) and is read once at startup. Edge, NAS, and
+home-network values come from the Turso replica and are read fresh on every action via
+`TursoCacheManager.read_group(identifier)` against the `master_configurations` table, grouped by
+the `identifier` column shown below -- no restart needed for these to take effect once synced.
 
 | Value | Source | Required/default | Consumer |
 |---|---|---|---|
@@ -448,8 +465,11 @@ docker compose ps
 docker compose logs --tail=100 -f
 ```
 
-After an Infisical-only or Turso-row-only change, use `docker compose restart commander` rather than
-rebuilding — both are read once at startup (§1, §7.3).
+A Turso-row change to an edge/NAS/home-network value needs no restart: it applies once the periodic
+sync (or a manual wait of up to `TURSO_DB_SYNC_INTERVAL`) has pulled it into the local replica (§1,
+§7.3). An Infisical-only change (Discord identity, MikroTik host/port/username, or the Turso
+connection/sync values themselves) still needs `docker compose restart commander` rather than a
+rebuild, since those are only read once at startup.
 
 Smoke-test sequence:
 
@@ -473,6 +493,12 @@ Smoke-test sequence:
 10. Verify Turso DOWN/RECOVERED alerts under a planned condition (e.g. temporarily revoke the Turso
     auth token, wait for the next `TURSO_DB_SYNC_INTERVAL` tick, confirm the DOWN alert, restore the
     token, confirm RECOVERED on the next tick) — not by relying on an actual Turso Cloud outage.
+11. Verify live-reload for a Turso-backed value: edit a low-risk value (e.g. `EDGE_INFO_SCRIPT`'s
+    contents, not the path itself) in Turso Studio, wait past the next `TURSO_DB_SYNC_INTERVAL` tick,
+    then run `/edge info` again **without restarting the container** and confirm the new behaviour
+    is reflected. Also confirm that setting an edge/NAS/home-network value to something invalid
+    (e.g. a space in `EDGE_SSH_USER`) makes only that one command fail with a Discord error reply,
+    without crashing the bot or other commands.
 
 The Docker image contains `openssh-client` and `iputils-ping`. If network status unexpectedly fails
 after an image rebuild, the focused diagnostic is `docker compose exec commander ping -c 1

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from commander.config import Config
+from commander.config import ConfigSource, load_network_config
 from commander.edge import EdgeController
 from commander.nas import NasController
 from commander.netmonitor import NetworkWatchdog, format_duration
@@ -48,14 +48,14 @@ class OperatorOperations:
 
     def __init__(
         self,
-        config: Config,
+        turso: ConfigSource,
         edge: EdgeController,
         network: NetworkChecker,
         nas: NasController,
         power_state: PowerOperationState,
         limiter: RateLimiter,
     ) -> None:
-        self._config = config
+        self._turso = turso
         self._edge = edge
         self._network = network
         self._nas = nas
@@ -119,6 +119,7 @@ class OperatorOperations:
     async def network_status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True, ephemeral=False)
         try:
+            network_config = load_network_config(self._turso)
             reachable = await asyncio.to_thread(self._network.is_reachable)
         except Exception:
             logger.exception("Unexpected failure while checking home network")
@@ -132,7 +133,7 @@ class OperatorOperations:
                 embed = _timestamped_embed(
                     title="🟢 Home network online",
                     description=(
-                        f"`{self._config.network.host}` answered the manual network probe."
+                        f"`{network_config.host}` answered the manual network probe."
                     ),
                     colour=discord.Colour.green(),
                 )
@@ -140,8 +141,8 @@ class OperatorOperations:
                 embed = _timestamped_embed(
                     title="🔴 Home network unreachable",
                     description=(
-                        f"`{self._config.network.host}` did not answer "
-                        f"{self._config.network.manual_probe_count} manual probe(s)."
+                        f"`{network_config.host}` did not answer "
+                        f"{network_config.manual_probe_count} manual probe(s)."
                     ),
                     colour=discord.Colour.red(),
                 )

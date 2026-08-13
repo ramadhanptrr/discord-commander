@@ -101,8 +101,8 @@ class CommanderBot(commands.Bot):
 
         self._config = config
         self._authorizer = InteractionAuthorizer(config.discord)
-        mikrotik = MikroTikClient(config.mikrotik)
-        network_checker = NetworkChecker(config.network)
+        mikrotik = MikroTikClient(turso_cache)
+        network_checker = NetworkChecker(turso_cache)
         power_state = PowerOperationState()
         watchdog_notifier = DiscordWatchdogNotifier(
             self,
@@ -113,10 +113,10 @@ class CommanderBot(commands.Bot):
         self._turso_cache = turso_cache
         self._turso_cache.attach_notifier(watchdog_notifier)
         self._turso_sync_task: asyncio.Task[None] | None = None
-        nas = NasController(config.nas, mikrotik)
+        nas = NasController(turso_cache, mikrotik)
         self._operations = OperatorOperations(
-            config,
-            EdgeController(config.edge),
+            turso_cache,
+            EdgeController(turso_cache),
             network_checker,
             nas,
             power_state,
@@ -124,12 +124,12 @@ class CommanderBot(commands.Bot):
         )
         self._network_watchdog = NetworkWatchdog(
             network_checker,
-            config.network,
+            turso_cache,
             watchdog_notifier,
         )
         self._nas_uptime_watchdog = NasUptimeWatchdog(
             nas,
-            config.nas_watchdog,
+            turso_cache,
             power_state,
             watchdog_notifier,
         )

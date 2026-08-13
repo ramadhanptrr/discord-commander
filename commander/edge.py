@@ -4,7 +4,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 
-from commander.config import EdgeConfig
+from commander.config import ConfigSource, load_edge_config
 
 
 logger = logging.getLogger("commander.edge")
@@ -17,12 +17,18 @@ class EdgeExecutionResult:
 
 
 class EdgeController:
-    """Run the configured fixed edge-info script through the system SSH client."""
+    """Run the configured fixed edge-info script through the system SSH client.
 
-    def __init__(self, config: EdgeConfig) -> None:
-        self._config = config
+    Reads the ``edge`` group fresh from the Turso local replica on every call, so a value edited
+    in Turso applies to the next invocation without a Commander restart. A bad/missing value
+    raises ``RuntimeError``, which the calling command handler turns into a Discord error reply.
+    """
+
+    def __init__(self, turso: ConfigSource) -> None:
+        self._turso = turso
 
     def execute_info_script(self) -> EdgeExecutionResult:
+        config = load_edge_config(self._turso)
         ssh_command = [
             "ssh",
             "-o",
@@ -32,9 +38,9 @@ class EdgeController:
             "-o",
             "ConnectTimeout=10",
             "-p",
-            str(self._config.ssh_port),
-            f"{self._config.ssh_user}@{self._config.internal_ip}",
-            self._config.info_script,
+            str(config.ssh_port),
+            f"{config.ssh_user}@{config.internal_ip}",
+            config.info_script,
         ]
 
         try:

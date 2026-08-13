@@ -90,12 +90,16 @@ docker compose logs --tail=100 -f
 ```
 
 After a code or dependency change, rebuild and recreate with `docker compose build` followed by
-`docker compose up -d`. After changing only an Infisical application value, restart the service so
-it materializes fresh startup configuration:
+`docker compose up -d`. After changing only an Infisical application value (Discord identity,
+MikroTik host/port/username, or the Turso connection/sync settings), restart the service so it
+materializes fresh startup configuration:
 
 ```bash
 docker compose restart commander
 ```
+
+A change to an edge/NAS/home-network value in Turso needs no restart — it applies on the next
+command or watchdog tick once the periodic sync has pulled it into the local replica.
 
 Use the smoke-test checklist in [WORKFLOW.md](./machine_lore/WORKFLOW.md#11-vps-deployment-and-smoke-test)
 after each deployment. Do not test `/wake nas` or `/shutdown nas` outside an appropriate maintenance
@@ -103,11 +107,14 @@ window: they intentionally change power state.
 
 ## Configuration at a glance
 
-Bootstrap credentials are mounted as Docker secrets. Discord and MikroTik values are fetched from
-Infisical. Edge, NAS, and home-network operational values are fetched from a Turso (libSQL) replica
-that Commander rebuilds fresh from Turso Cloud on every startup; the Turso connection/sync settings
-themselves still come from Infisical. No token or device credential belongs in this repository or a
-Compose environment file.
+Bootstrap credentials are mounted as Docker secrets. Discord and MikroTik identity values are
+fetched from Infisical once at startup and require a restart to change. Edge, NAS, and
+home-network operational values (including the shared SSH key path) are fetched from a Turso
+(libSQL) replica that Commander rebuilds fresh from Turso Cloud on every startup, and are then
+re-read straight from that local replica on every command and every watchdog tick — a value edited
+in Turso applies on the next action once the periodic sync has pulled it in, with no restart
+needed. The Turso connection/sync settings themselves still come from Infisical. No token or device
+credential belongs in this repository or a Compose environment file.
 
 | Group | Source | Required values |
 |---|---|---|

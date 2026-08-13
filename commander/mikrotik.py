@@ -3,19 +3,24 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from commander.config import MikroTikConfig
+from commander.config import ConfigSource, load_mikrotik_config
 
 
 logger = logging.getLogger("commander.mikrotik")
 
 
 class MikroTikClient:
-    """Execute the fixed RouterOS operations used by Commander through SSH."""
+    """Execute the fixed RouterOS operations used by Commander through SSH.
 
-    def __init__(self, config: MikroTikConfig) -> None:
-        self._config = config
+    Identity comes from Infisical and the shared SSH key path from Turso; both are re-read fresh
+    on every call so a Turso-side SSH key path change applies without a restart.
+    """
+
+    def __init__(self, turso: ConfigSource) -> None:
+        self._turso = turso
 
     def _ssh(self, command: str, timeout: int = 15) -> tuple[bool, str]:
+        config = load_mikrotik_config(self._turso)
         ssh_command = [
             "ssh",
             "-o",
@@ -23,11 +28,11 @@ class MikroTikClient:
             "-o",
             "UserKnownHostsFile=/dev/null",
             "-p",
-            str(self._config.port),
+            str(config.port),
         ]
-        if self._config.ssh_key_path:
-            ssh_command.extend(["-i", self._config.ssh_key_path])
-        ssh_command.extend([f"{self._config.username}@{self._config.host}", command])
+        if config.ssh_key_path:
+            ssh_command.extend(["-i", config.ssh_key_path])
+        ssh_command.extend([f"{config.username}@{config.host}", command])
 
         try:
             result = subprocess.run(

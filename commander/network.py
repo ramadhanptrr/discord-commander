@@ -3,22 +3,27 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from commander.config import NetworkConfig
+from commander.config import ConfigSource, load_network_config
 
 
 logger = logging.getLogger("commander.network")
 
 
 class NetworkChecker:
-    """Probe the home gateway directly from the container over the routed path."""
+    """Probe the home gateway directly from the container over the routed path.
 
-    def __init__(self, config: NetworkConfig) -> None:
-        self._config = config
+    Reads the ``home_network`` group fresh from Turso on every call, so an edited timeout or
+    default probe count applies to the next probe without a Commander restart.
+    """
+
+    def __init__(self, turso: ConfigSource) -> None:
+        self._turso = turso
 
     def is_reachable(self, host: str | None = None, count: int | None = None) -> bool:
-        host = host or self._config.host
-        count = count or self._config.manual_probe_count
-        timeout = self._config.ping_timeout_seconds
+        config = load_network_config(self._turso)
+        host = host or config.host
+        count = count or config.manual_probe_count
+        timeout = config.ping_timeout_seconds
         command = [
             "ping",
             "-c",
