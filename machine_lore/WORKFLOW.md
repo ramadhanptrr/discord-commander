@@ -389,10 +389,9 @@ rather than living inside the data they are used to fetch (`commander/config.py:
 ### 9.3 Device and operation values
 
 MikroTik identity stays on Infisical (it is the SSH target used to reach the rest of the home
-network, not itself managed through Turso). `EDGE_SSH_USER` also stays on Infisical. The remaining
-edge, NAS, and home-network values come from the Turso replica, read once at startup via
-`TursoCacheManager.read_group(identifier)` from the `master_configurations` table, grouped by the
-`identifier` column shown below.
+network, not itself managed through Turso). Edge, NAS, and home-network values come from the
+Turso replica, read once at startup via `TursoCacheManager.read_group(identifier)` from the
+`master_configurations` table, grouped by the `identifier` column shown below.
 
 | Value | Source | Required/default | Consumer |
 |---|---|---|---|
@@ -408,7 +407,7 @@ edge, NAS, and home-network values come from the Turso replica, read once at sta
 | `NAS_UPTIME_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed unprivileged script that prints boot epoch. |
 | `EDGE_INTERNAL_IP` | Turso (`edge`) | Required safe hostname/IP | Edge host SSH target. |
 | `EDGE_SSH_PORT` | Turso (`edge`) | Optional; `22` | Edge host SSH port. |
-| `EDGE_SSH_USER` | Infisical | Required safe SSH username | Edge host SSH account. |
+| `EDGE_SSH_USER` | Turso (`edge`) | Required safe SSH username | Edge host SSH account. |
 | `EDGE_INFO_SCRIPT` | Turso (`edge`) | Required safe absolute path | Fixed edge information script. |
 | `SSH_KEY_PATH` | Turso (`home_network`) | Optional | Explicit SSH identity used by MikroTik and NAS operations. Edge SSH relies on OpenSSH's default identity selection. |
 

@@ -274,10 +274,9 @@ def load_turso_config() -> TursoConfig:
 def load_config(turso: ConfigSource) -> Config:
     """Build immutable runtime configuration. No secret values are logged.
 
-    Discord and MikroTik identity still come from Infisical, as does ``EDGE_SSH_USER``. The
-    remaining edge, NAS, and home-network operational values (including the shared SSH key path)
-    come from the Turso local replica in ``turso``, which must already be bootstrapped by the
-    caller before this runs.
+    Discord and MikroTik identity still come from Infisical. Edge, NAS, and home-network
+    operational values (including the shared SSH key path) come from the Turso local replica in
+    ``turso``, which must already be bootstrapped by the caller before this runs.
     """
     v = _infisical_values()
     edge = _group_values(turso.read_group("edge"))
@@ -304,7 +303,7 @@ def load_config(turso: ConfigSource) -> Config:
         edge=EdgeConfig(
             internal_ip=edge.host("EDGE_INTERNAL_IP"),
             ssh_port=edge.positive_int("EDGE_SSH_PORT", default=22),
-            ssh_user=v.ssh_username("EDGE_SSH_USER"),
+            ssh_user=edge.ssh_username("EDGE_SSH_USER"),
             info_script=edge.script_path("EDGE_INFO_SCRIPT"),
         ),
         mikrotik=MikroTikConfig(
