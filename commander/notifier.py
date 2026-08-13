@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import discord
 
 from commander.netmonitor import format_duration
+
+
+def _format_timestamp(epoch_seconds: float | None) -> str:
+    if epoch_seconds is None:
+        return "unknown"
+    moment = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+    return discord.utils.format_dt(moment, style="R")
 
 
 class DiscordWatchdogNotifier:
@@ -79,6 +88,69 @@ class DiscordWatchdogNotifier:
             inline=False,
         )
         embed.set_footer(text="NAS uptime watchdog • Automatic reminder")
+        await (await self._channel()).send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_turso_down(self, last_successful_sync: float | None) -> None:
+        embed = discord.Embed(
+            title="🔴 Turso DB DOWN",
+            description=(
+                "Synchronization with Turso failed. Commander is continuing with the last "
+                "available local configuration."
+            ),
+            colour=discord.Colour.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Last successful sync",
+            value=_format_timestamp(last_successful_sync),
+            inline=False,
+        )
+        embed.set_footer(text="Turso watchdog • Automatic alert")
+        await (await self._channel()).send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_turso_down_reminder(
+        self, down_since: float, last_successful_sync: float | None
+    ) -> None:
+        embed = discord.Embed(
+            title="🔴 Turso DB is still DOWN",
+            description=(
+                "Synchronization with Turso is still failing. Commander continues to use the "
+                "last available local configuration."
+            ),
+            colour=discord.Colour.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="Down since", value=_format_timestamp(down_since), inline=True)
+        embed.add_field(
+            name="Last successful sync",
+            value=_format_timestamp(last_successful_sync),
+            inline=True,
+        )
+        embed.set_footer(text="Turso watchdog • Automatic reminder")
+        await (await self._channel()).send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_turso_recovered(self, downtime: float | None) -> None:
+        duration = format_duration(downtime) if downtime is not None else "unknown"
+        embed = discord.Embed(
+            title="🟢 Turso DB RECOVERED",
+            description=(
+                "Synchronization with Turso has recovered. The local configuration database "
+                "has been refreshed."
+            ),
+            colour=discord.Colour.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="Downtime", value=f"~{duration}", inline=True)
+        embed.set_footer(text="Turso watchdog • Automatic alert")
         await (await self._channel()).send(
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),

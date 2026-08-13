@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from commander.authorization import InteractionAuthorizer
-from commander.config import Config, load_config
+from commander.config import Config, load_config, load_turso_config
 from commander.edge import EdgeController
 from commander.logger import setup_logger
 from commander.mikrotik import MikroTikClient
@@ -20,10 +21,13 @@ from commander.notifier import DiscordWatchdogNotifier
 from commander.operations import OperatorOperations
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
+from commander.turso.cache_manager import TursoCacheManager
 from commander.ui.panel import CommanderPanel, build_panel_embed
 
 
 logger = setup_logger()
+
+TURSO_LOCAL_DB_PATH = os.getenv("TURSO_LOCAL_DB_PATH", "/data/turso/local.db")
 
 
 class StatusCommandGroup(app_commands.Group):
@@ -90,7 +94,7 @@ class ShutdownCommandGroup(app_commands.Group):
 class CommanderBot(commands.Bot):
     """Discord transport for the first Commander migration phase."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, turso_cache: TursoCacheManager) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
@@ -106,6 +110,9 @@ class CommanderBot(commands.Bot):
             config.network.watchdog_interval_seconds,
         )
         self._watchdog_notifier = watchdog_notifier
+        self._turso_cache = turso_cache
+        self._turso_cache.attach_notifier(watchdog_notifier)
+        self._turso_sync_task: asyncio.Task[None] | None = None
         nas = NasController(config.nas, mikrotik)
         self._operations = OperatorOperations(
             config,
@@ -256,6 +263,10 @@ class CommanderBot(commands.Bot):
             self._nas_uptime_watchdog_task = asyncio.create_task(
                 self._nas_uptime_watchdog.run(), name="nas-uptime-watchdog"
             )
+        if self._turso_sync_task is None or self._turso_sync_task.done():
+            self._turso_sync_task = asyncio.create_task(
+                self._turso_cache.run_periodic_sync(), name="turso-sync"
+            )
         await self._notify_startup_once()
 
     async def _notify_startup_once(self) -> None:
@@ -277,6 +288,7 @@ class CommanderBot(commands.Bot):
         watchdog_tasks = (
             self._network_watchdog_task,
             self._nas_uptime_watchdog_task,
+            self._turso_sync_task,
         )
         for task in watchdog_tasks:
             if task is not None and not task.done():
@@ -290,6 +302,8 @@ class CommanderBot(commands.Bot):
                 pass
             except Exception:
                 logger.exception("Watchdog task ended with an unexpected error during shutdown")
+        logger.info("Stopping Turso database synchronization task.")
+        await self._turso_cache.aclose()
         await super().close()
 
     async def on_app_command_error(
@@ -307,14 +321,20 @@ class CommanderBot(commands.Bot):
 
 
 def main() -> None:
-    config = load_config()
+    turso_config = load_turso_config()
+    turso_cache = TursoCacheManager(turso_config, TURSO_LOCAL_DB_PATH)
+    # Fresh replica on every process start (migrations/turso_migrations.md §7); this must finish
+    # before load_config() below, which reads edge/NAS/home-network values out of the replica.
+    asyncio.run(turso_cache.bootstrap())
+
+    config = load_config(turso_cache)
     logger.info(
         "Starting Discord Commander for %s allowed guild(s); control channel=%s; watchdog channel=%s",
         len(config.discord.guild_ids),
         config.discord.control_room_channel_id,
         config.discord.watchdog_channel_id,
     )
-    CommanderBot(config).run(config.discord.bot_token, log_handler=None)
+    CommanderBot(config, turso_cache).run(config.discord.bot_token, log_handler=None)
 
 
 if __name__ == "__main__":

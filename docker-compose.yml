@@ -14,8 +14,10 @@ services:
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-prod}
       INFISICAL_SECRET_PATH: ${INFISICAL_SECRET_PATH:-/}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TURSO_LOCAL_DB_PATH: ${TURSO_LOCAL_DB_PATH:-/data/turso/local.db}
     volumes:
       - ~/.ssh:/root/.ssh:ro
+      - commander_turso_data:/data/turso
 
 secrets:
   infisical_client_id:
@@ -24,3 +26,6 @@ secrets:
     file: ~/secrets/infisical/INFISICAL_CLIENT_SECRET
   infisical_project_id:
     file: ~/secrets/infisical/INFISICAL_PROJECT_ID
+
+volumes:
+  commander_turso_data:

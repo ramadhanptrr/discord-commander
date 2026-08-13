@@ -1,2 +1,3 @@
 discord.py==2.5.1
 infisicalsdk
+pyturso==0.7.2
