@@ -38,3 +38,4 @@ docs/
 
 # Private migration notes
 MIGRATION_PLAN.md
+migrations/

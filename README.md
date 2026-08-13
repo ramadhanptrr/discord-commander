@@ -103,15 +103,19 @@ window: they intentionally change power state.
 
 ## Configuration at a glance
 
-Bootstrap credentials are mounted as Docker secrets; application values are fetched from Infisical.
-No token or device credential belongs in this repository or a Compose environment file.
+Bootstrap credentials are mounted as Docker secrets. Discord and MikroTik values are fetched from
+Infisical. Edge, NAS, and home-network operational values are fetched from a Turso (libSQL) replica
+that Commander rebuilds fresh from Turso Cloud on every startup; the Turso connection/sync settings
+themselves still come from Infisical. No token or device credential belongs in this repository or a
+Compose environment file.
 
-| Group | Required Infisical values |
-|---|---|
-| Discord access | `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_IDS`, `DISCORD_CONTROL_ROOM_CHANNEL_ID`, `DISCORD_WATCHDOG_CHANNEL_ID`, `DISCORD_ALLOWED_USER_IDS` |
-| MikroTik | `MIKROTIK_HOST`, `MIKROTIK_USERNAME`, `NAS_IP`, `NAS_MAC`, `NAS_WOL_INTERFACE` |
-| NAS actions/watchdog | `NAS_USER`, `NAS_SHUTDOWN_SCRIPT`, `NAS_UPTIME_SCRIPT`, `NAS_MAX_AGE_MINUTE`, `NAS_MAX_AGE_REMINDER_MINUTE` |
-| Edge info | `EDGE_INTERNAL_IP`, `EDGE_SSH_USER`, `EDGE_INFO_SCRIPT` |
+| Group | Source | Required values |
+|---|---|---|
+| Discord access | Infisical | `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_IDS`, `DISCORD_CONTROL_ROOM_CHANNEL_ID`, `DISCORD_WATCHDOG_CHANNEL_ID`, `DISCORD_ALLOWED_USER_IDS` |
+| MikroTik | Infisical | `MIKROTIK_HOST`, `MIKROTIK_USERNAME` |
+| Turso connection/sync | Infisical | `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TURSO_DB_SYNC_INTERVAL`, `TURSO_DB_DOWN_REMINDER` |
+| NAS actions/watchdog | Turso (`nas`) | `NAS_IP`, `NAS_MAC`, `NAS_WOL_INTERFACE`, `NAS_USER`, `NAS_SHUTDOWN_SCRIPT`, `NAS_UPTIME_SCRIPT`, `NAS_MAX_AGE_MINUTE`, `NAS_MAX_AGE_REMINDER_MINUTE` |
+| Edge info | Turso (`edge`) | `EDGE_INTERNAL_IP`, `EDGE_SSH_USER`, `EDGE_INFO_SCRIPT` |
 
 Ports, timing values, optional `SSH_KEY_PATH`, and all defaults are documented in the
 [configuration reference](./machine_lore/WORKFLOW.md#9-configuration-reference).
@@ -121,6 +125,7 @@ Ports, timing values, optional `SSH_KEY_PATH`, and all defaults are documented i
 - Python 3.11 and `discord.py` 2.5.1
 - Discord guild application commands and persistent UI components
 - Infisical Universal Auth for startup configuration
+- Turso (libSQL) local replica for edge/NAS/home-network operational configuration
 - OpenSSH client for MikroTik, NAS, and edge-host operations
 - `iputils-ping` for direct home-network probes
 - Docker Compose on the VPS

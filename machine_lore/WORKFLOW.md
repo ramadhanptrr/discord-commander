@@ -12,34 +12,46 @@ reliability gaps are in [AUDIT.md](./AUDIT.md).
 
 ## 1. Runtime overview
 
-One process has three sources of work:
+One process has four sources of work:
 
 1. Guild-scoped Discord slash commands and control-panel button interactions.
 2. A background watchdog for home-network reachability.
 3. A background watchdog for NAS uptime.
+4. A background synchronization task for the Turso-backed configuration replica.
 
 All blocking network and SSH work is moved to a worker thread with `asyncio.to_thread()`. The
 Discord event loop remains responsible for interactions, embeds, and watchdog scheduling.
 
 ```text
 main()
-  -> load_config() from Infisical
-  -> CommanderBot(config)
+  -> load_turso_config() from Infisical (Turso URL/token/sync intervals)
+  -> TursoCacheManager.bootstrap(): delete any existing local replica, pull a fresh one from
+     Turso Cloud (fails startup on error/timeout)
+  -> load_config(turso_cache) from Infisical (Discord, MikroTik) + the fresh Turso replica
+     (edge, NAS, home-network values)
+  -> CommanderBot(config, turso_cache)
        -> build authorization, controllers, state, limiter, and watchdogs
+       -> attach the watchdog notifier to the Turso cache manager
        -> register guild slash-command groups and persistent panel view
   -> Bot.run()
        -> setup_hook(): validate configured Discord channels; sync commands to every allowed guild
-       -> on_ready(): start network and NAS-uptime watchdog tasks; send one startup notification
+       -> on_ready(): start network, NAS-uptime, and Turso-sync watchdog tasks; send one startup
+          notification
        -> Discord gateway: slash commands and button interactions
 ```
 
-Configuration is read once when the process starts. An Infisical change therefore requires a
-container restart before the running controllers use it.
+Configuration is read once when the process starts, from a Turso replica that is itself rebuilt
+fresh on every startup. A Turso or Infisical change therefore requires a container restart before
+the running controllers use it. The Turso periodic sync task keeps the *local replica file* current
+and drives DOWN/RECOVERED health alerts, but it does not hot-reload already-running controllers —
+see [§9.2a](#92a-turso-connection-and-sync-values-infisical).
 
 ## 2. Startup, command registration, and shutdown
 
-`commander.bot.main()` loads immutable configuration before attempting a Discord connection. Missing
-or invalid Infisical values stop startup without logging their secret values.
+`commander.bot.main()` bootstraps the Turso local replica, then loads immutable configuration,
+before attempting a Discord connection. Missing/invalid Infisical values, a failed or timed-out
+Turso bootstrap, and invalid Turso-sourced values all stop startup without logging secret values
+(bootstrap timeout: 5 seconds).
 
 `CommanderBot` then creates the following process-local components:
 
@@ -48,7 +60,9 @@ or invalid Infisical values stop startup without logging their secret values.
 - `NetworkChecker` for direct container ICMP probes;
 - `PowerOperationState` to make wake and shutdown mutually exclusive;
 - `RateLimiter` for confirmed power actions;
-- `NetworkWatchdog` and `NasUptimeWatchdog` with a shared Discord notifier.
+- `NetworkWatchdog` and `NasUptimeWatchdog` with a shared Discord notifier;
+- a `TursoCacheManager` reference (already bootstrapped in `main()`), with the same Discord
+  notifier attached for DOWN/RECOVERED alerts.
 
 During `setup_hook()` the bot registers a persistent `CommanderPanel`, validates both configured
 channels through Discord, and synchronizes every application command to each ID in
@@ -291,6 +305,28 @@ The notifier records a reminder only after sending succeeds. An offline NAS or a
 threshold resets the reminder cycle. As with other in-memory state, a container restart forgets the
 last reminder timestamp; a still-online NAS already over its threshold can alert again after restart.
 
+### 7.3 Turso synchronization watchdog
+
+This watchdog is not a home-device probe: it reports the health of the configuration replica
+itself (`commander/turso/cache_manager.py`), separate from the network and NAS watchdogs above.
+
+```text
+every TURSO_DB_SYNC_INTERVAL minutes
+  -> pull the local replica from Turso Cloud
+       -> success while UP: remain silent, log only
+       -> success while DOWN: refresh local replica; send RECOVERED alert; state UP
+       -> failure while UP: send DOWN alert; record down_since; state DOWN
+       -> failure while DOWN: send a reminder only if TURSO_DB_DOWN_REMINDER minutes have
+          elapsed since the last DOWN/reminder alert; otherwise stay silent
+```
+
+A sync failure never stops Commander and never deletes the local replica: business modules keep
+reading the configuration snapshot that was already materialized into `Config` at startup (see §1).
+The sync task exists to (a) keep the on-disk replica fresh for the *next* container restart's fresh
+bootstrap, and (b) alert operators when Turso Cloud itself is unreachable. It does not hot-reload
+`EdgeConfig`/`NasConfig`/`NetworkConfig` values into the running process — that still requires a
+restart, same as the pre-Turso Infisical-only design (`AUDIT.md` CFG-01).
+
 ## 8. SSH execution and output rules
 
 All subprocesses use argv lists rather than a local shell. Remote values are configuration-derived
@@ -320,9 +356,13 @@ All current SSH clients use `StrictHostKeyChecking=accept-new` with
 | `INFISICAL_ENVIRONMENT` | No | `prod` | Infisical environment slug. |
 | `INFISICAL_SECRET_PATH` | No | `/` | Infisical secret path. |
 | `LOG_LEVEL` | No | `INFO` | Python console log level. |
+| `TURSO_LOCAL_DB_PATH` | No | `/data/turso/local.db` | Path to the local Turso replica file; deleted and rebuilt on every startup (§7.3). Mounted as the `commander_turso_data` Compose volume. |
 
 The Compose file mounts the three required bootstrap values from `~/secrets/infisical/` on the VPS.
-Application configuration below is then read from Infisical, not from Compose variables.
+Discord and MikroTik application configuration is read from Infisical; edge/NAS/home-network
+application configuration is read from the Turso replica at `TURSO_LOCAL_DB_PATH` once
+`TursoCacheManager.bootstrap()` has populated it (§9.2a, §9.3, §9.4) — none of it comes from Compose
+variables.
 
 ### 9.2 Discord application values
 
@@ -334,45 +374,63 @@ Application configuration below is then read from Infisical, not from Compose va
 | `DISCORD_WATCHDOG_CHANNEL_ID` | Yes | Positive channel snowflake for automated alerts only; must differ from control room. |
 | `DISCORD_ALLOWED_USER_IDS` | Yes | One or more positive user snowflakes, comma-separated. |
 
+### 9.2a Turso connection and sync values (Infisical)
+
+These four values must exist before the Turso replica does, so they stay on the Infisical path
+rather than living inside the data they are used to fetch (`commander/config.py:load_turso_config`).
+
+| Secret | Required/default | Format/meaning |
+|---|---|---|
+| `TURSO_DATABASE_URL` | Yes | libSQL/Turso Cloud database URL (`remote_url` for `turso.sync.connect`). |
+| `TURSO_AUTH_TOKEN` | Yes | Turso auth token. Never log or commit it. |
+| `TURSO_DB_SYNC_INTERVAL` | Yes | Positive integer **minutes** between periodic replica syncs (§7.3). |
+| `TURSO_DB_DOWN_REMINDER` | Yes | Positive integer **minutes** between DOWN reminder alerts while Turso stays unreachable (§7.3). |
+
 ### 9.3 Device and operation values
 
-| Secret | Required/default | Consumer |
-|---|---|---|
-| `MIKROTIK_HOST` | Required safe hostname/IP | MikroTik SSH target and direct home-network probe target. |
-| `MIKROTIK_PORT` | Optional; `22` | MikroTik SSH port. |
-| `MIKROTIK_USERNAME` | Required safe SSH username | MikroTik SSH account. |
-| `NAS_IP` | Required safe hostname/IP | NAS address for MikroTik status checks and direct NAS SSH. |
-| `NAS_MAC` | Required colon-separated MAC | Wake-on-LAN target. |
-| `NAS_WOL_INTERFACE` | Required safe RouterOS interface name | Interface passed to RouterOS WoL. Spaces and common interface punctuation are accepted; quotes/control characters are not. |
-| `NAS_SSH_PORT` | Optional; `22` | NAS SSH port. |
-| `NAS_USER` | Required safe SSH username | NAS SSH account. |
-| `NAS_SHUTDOWN_SCRIPT` | Required safe absolute path | Fixed privileged script invoked by shutdown. |
-| `NAS_UPTIME_SCRIPT` | Required safe absolute path | Fixed unprivileged script that prints boot epoch. |
-| `EDGE_INTERNAL_IP` | Required safe hostname/IP | Edge host SSH target. |
-| `EDGE_SSH_PORT` | Optional; `22` | Edge host SSH port. |
-| `EDGE_SSH_USER` | Required safe SSH username | Edge host SSH account. |
-| `EDGE_INFO_SCRIPT` | Required safe absolute path | Fixed edge information script. |
-| `SSH_KEY_PATH` | Optional | Explicit SSH identity used by MikroTik and NAS operations. Edge SSH relies on OpenSSH's default identity selection. |
+MikroTik identity stays on Infisical (it is the SSH target used to reach the rest of the home
+network, not itself managed through Turso). Edge, NAS, and home-network values now come from the
+Turso replica, read once at startup via `TursoCacheManager.read_group(identifier)` from the
+`master_configurations` table, grouped by the `identifier` column shown below.
+
+| Value | Source | Required/default | Consumer |
+|---|---|---|---|
+| `MIKROTIK_HOST` | Infisical | Required safe hostname/IP | MikroTik SSH target and direct home-network probe target. |
+| `MIKROTIK_PORT` | Infisical | Optional; `22` | MikroTik SSH port. |
+| `MIKROTIK_USERNAME` | Infisical | Required safe SSH username | MikroTik SSH account. |
+| `NAS_IP` | Turso (`nas`) | Required safe hostname/IP | NAS address for MikroTik status checks and direct NAS SSH. |
+| `NAS_MAC` | Turso (`nas`) | Required colon-separated MAC | Wake-on-LAN target. |
+| `NAS_WOL_INTERFACE` | Turso (`nas`) | Required safe RouterOS interface name | Interface passed to RouterOS WoL. Spaces and common interface punctuation are accepted; quotes/control characters are not. |
+| `NAS_SSH_PORT` | Turso (`nas`) | Optional; `22` | NAS SSH port. |
+| `NAS_USER` | Turso (`nas`) | Required safe SSH username | NAS SSH account. |
+| `NAS_SHUTDOWN_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed privileged script invoked by shutdown. |
+| `NAS_UPTIME_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed unprivileged script that prints boot epoch. |
+| `EDGE_INTERNAL_IP` | Turso (`edge`) | Required safe hostname/IP | Edge host SSH target. |
+| `EDGE_SSH_PORT` | Turso (`edge`) | Optional; `22` | Edge host SSH port. |
+| `EDGE_SSH_USER` | Turso (`edge`) | Required safe SSH username | Edge host SSH account. |
+| `EDGE_INFO_SCRIPT` | Turso (`edge`) | Required safe absolute path | Fixed edge information script. |
+| `SSH_KEY_PATH` | Turso (`home_network`) | Optional | Explicit SSH identity used by MikroTik and NAS operations. Edge SSH relies on OpenSSH's default identity selection. |
 
 ### 9.4 Watchdog and probe values
 
-| Secret | Required/default | Unit and behaviour |
-|---|---|---|
-| `NAS_MONITOR_INTERVAL` | Optional; `60` | Positive seconds between NAS uptime ticks. |
-| `NAS_MAX_AGE_MINUTE` | Required | Positive minutes before first NAS-online reminder. |
-| `NAS_MAX_AGE_REMINDER_MINUTE` | Required | Positive minutes between NAS-online reminders. |
-| `TIMED_OUT_INTERVAL` | Optional; `10` | Positive minutes between home-network watchdog ticks. |
-| `NETWORK_PING_COUNT` | Optional; `10` | Positive probe count for DOWN detection and confirmation. |
-| `NETWORK_RECOVERY_PING_COUNT` | Optional; `5` | Positive probe count for recovery and manual status checks. |
-| `NETWORK_PING_TIMEOUT` | Optional; `3` | Positive seconds waited per ICMP probe. |
-| `NETWORK_ANCHOR_HOST` | Optional; disabled when empty | Safe hostname/IP used as the VPS uplink control probe. |
-| `NETWORK_CONFIRM_DELAY` | Optional; `15` | Non-negative seconds before a second outage check. `0` disables the delay/confirmation round. |
+| Value | Source | Required/default | Unit and behaviour |
+|---|---|---|---|
+| `NAS_MONITOR_INTERVAL` | Turso (`nas`) | Optional; `60` | Positive seconds between NAS uptime ticks. |
+| `NAS_MAX_AGE_MINUTE` | Turso (`nas`) | Required | Positive minutes before first NAS-online reminder. |
+| `NAS_MAX_AGE_REMINDER_MINUTE` | Turso (`nas`) | Required | Positive minutes between NAS-online reminders. |
+| `TIMED_OUT_INTERVAL` | Turso (`home_network`) | Optional; `10` | Positive minutes between home-network watchdog ticks. |
+| `NETWORK_PING_COUNT` | Turso (`home_network`) | Optional; `10` | Positive probe count for DOWN detection and confirmation. |
+| `NETWORK_RECOVERY_PING_COUNT` | Turso (`home_network`) | Optional; `5` | Positive probe count for recovery and manual status checks. |
+| `NETWORK_PING_TIMEOUT` | Turso (`home_network`) | Optional; `3` | Positive seconds waited per ICMP probe. |
+| `NETWORK_ANCHOR_HOST` | Turso (`home_network`) | Optional; disabled when empty | Safe hostname/IP used as the VPS uplink control probe. |
+| `NETWORK_CONFIRM_DELAY` | Turso (`home_network`) | Optional; `15` | Non-negative seconds before a second outage check. `0` disables the delay/confirmation round. |
 
 ## 10. Logging and failure handling
 
 The `commander` logger writes timestamped records to stdout at `LOG_LEVEL`. It logs startup summary,
 application-command sync counts, watchdog configuration, expected operation failures, authorization
-rejections, and unexpected exceptions. It is designed not to log Infisical secret values.
+rejections, and unexpected exceptions. It is designed not to log Infisical secret values, and the
+Turso cache manager is designed not to log `TURSO_AUTH_TOKEN` or any connection string containing it.
 
 Expected SSH/ping failures are rendered as English Discord embeds or script-output attachments in
 the control room. Watchdog tick failures are logged and do not terminate their background loop.
@@ -390,13 +448,15 @@ docker compose ps
 docker compose logs --tail=100 -f
 ```
 
-After an Infisical-only change, use `docker compose restart commander` rather than rebuilding.
+After an Infisical-only or Turso-row-only change, use `docker compose restart commander` rather than
+rebuilding — both are read once at startup (§1, §7.3).
 
 Smoke-test sequence:
 
 1. Confirm the `commander` container stays running in `docker compose ps`.
-2. Inspect startup logs for missing/invalid secret errors, successful command sync, and both watchdog
-   startup lines.
+2. Inspect startup logs for: Turso local-database removal (only present on a restart with a prior
+   replica), successful Turso bootstrap, missing/invalid secret errors, successful command sync, and
+   all three watchdog startup lines (network, NAS uptime, Turso sync).
 3. Confirm the bot appears online in each intended Discord guild and slash commands are visible in
    the control room.
 4. From an allowed user in the control room, use `/ping` and `/help`.
@@ -410,6 +470,9 @@ Smoke-test sequence:
    actual power operations only in a safe maintenance window.
 9. Verify an automatic watchdog alert is delivered to the dedicated watchdog channel under a planned
    test condition; do not use a production outage as the test procedure.
+10. Verify Turso DOWN/RECOVERED alerts under a planned condition (e.g. temporarily revoke the Turso
+    auth token, wait for the next `TURSO_DB_SYNC_INTERVAL` tick, confirm the DOWN alert, restore the
+    token, confirm RECOVERED on the next tick) — not by relying on an actual Turso Cloud outage.
 
 The Docker image contains `openssh-client` and `iputils-ping`. If network status unexpectedly fails
 after an image rebuild, the focused diagnostic is `docker compose exec commander ping -c 1

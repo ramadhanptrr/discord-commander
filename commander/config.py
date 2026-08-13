@@ -4,6 +4,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from typing import Callable, Protocol
 
 from infisical_sdk import InfisicalSDKClient
 
@@ -61,101 +62,122 @@ class Secrets:
 _secrets = Secrets()
 
 
-def _required(key: str) -> str:
-    value = _secrets.get(key).strip()
-    if not value:
-        raise RuntimeError(f"Missing required secret: {key}")
-    return value
+class ConfigSource(Protocol):
+    """Anything that can hand back the flat key/value rows for a Turso identifier group."""
+
+    def read_group(self, identifier: str) -> dict[str, str]: ...
 
 
-def _positive_int(key: str, default: int | None = None) -> int:
-    raw = _secrets.get(key).strip()
-    if not raw:
-        if default is None:
+class ConfigValues:
+    """Validates configuration values pulled from an arbitrary key/value source.
+
+    Discord and MikroTik values read straight from Infisical; edge/NAS/home-network values
+    read from a Turso identifier group (already synced into the local replica). Both sources
+    expose the same "get raw string for this key" shape, so the same validation rules apply
+    regardless of where a value came from.
+    """
+
+    def __init__(self, get: Callable[[str], str]) -> None:
+        self._get = get
+
+    def optional(self, key: str) -> str:
+        return self._get(key).strip()
+
+    def required(self, key: str) -> str:
+        value = self.optional(key)
+        if not value:
             raise RuntimeError(f"Missing required secret: {key}")
-        return default
+        return value
 
-    try:
-        value = int(raw)
-    except ValueError as error:
-        raise RuntimeError(f"Secret {key} must be an integer") from error
+    def positive_int(self, key: str, default: int | None = None) -> int:
+        raw = self.optional(key)
+        if not raw:
+            if default is None:
+                raise RuntimeError(f"Missing required secret: {key}")
+            return default
 
-    if value <= 0:
-        raise RuntimeError(f"Secret {key} must be a positive integer")
-    return value
-
-
-def _non_negative_int(key: str, default: int | None = None) -> int:
-    raw = _secrets.get(key).strip()
-    if not raw:
-        if default is None:
-            raise RuntimeError(f"Missing required secret: {key}")
-        return default
-
-    try:
-        value = int(raw)
-    except ValueError as error:
-        raise RuntimeError(f"Secret {key} must be an integer") from error
-
-    if value < 0:
-        raise RuntimeError(f"Secret {key} must be zero or a positive integer")
-    return value
-
-
-def _snowflake_list(key: str) -> frozenset[int]:
-    raw = _required(key)
-    values: set[int] = set()
-
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
         try:
-            value = int(item)
+            value = int(raw)
         except ValueError as error:
-            raise RuntimeError(f"Secret {key} contains a non-integer Discord ID") from error
+            raise RuntimeError(f"Secret {key} must be an integer") from error
+
         if value <= 0:
-            raise RuntimeError(f"Secret {key} contains a non-positive Discord ID")
-        values.add(value)
+            raise RuntimeError(f"Secret {key} must be a positive integer")
+        return value
 
-    if not values:
-        raise RuntimeError(f"Secret {key} must contain at least one Discord ID")
-    return frozenset(values)
+    def non_negative_int(self, key: str, default: int | None = None) -> int:
+        raw = self.optional(key)
+        if not raw:
+            if default is None:
+                raise RuntimeError(f"Missing required secret: {key}")
+            return default
+
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise RuntimeError(f"Secret {key} must be an integer") from error
+
+        if value < 0:
+            raise RuntimeError(f"Secret {key} must be zero or a positive integer")
+        return value
+
+    def snowflake_list(self, key: str) -> frozenset[int]:
+        raw = self.required(key)
+        values: set[int] = set()
+
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                value = int(item)
+            except ValueError as error:
+                raise RuntimeError(f"Secret {key} contains a non-integer Discord ID") from error
+            if value <= 0:
+                raise RuntimeError(f"Secret {key} contains a non-positive Discord ID")
+            values.add(value)
+
+        if not values:
+            raise RuntimeError(f"Secret {key} must contain at least one Discord ID")
+        return frozenset(values)
+
+    def host(self, key: str) -> str:
+        value = self.required(key)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value):
+            raise RuntimeError(f"Secret {key} must be a safe hostname or IP address")
+        return value
+
+    def ssh_username(self, key: str) -> str:
+        value = self.required(key)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise RuntimeError(f"Secret {key} must be a safe SSH username")
+        return value
+
+    def script_path(self, key: str) -> str:
+        value = self.required(key)
+        if not re.fullmatch(r"/[\w./-]+", value):
+            raise RuntimeError(f"Secret {key} must be an absolute safe script path")
+        return value
+
+    def mac_address(self, key: str) -> str:
+        value = self.required(key).upper()
+        if not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", value):
+            raise RuntimeError(f"Secret {key} must be a colon-separated MAC address")
+        return value
+
+    def router_interface(self, key: str) -> str:
+        value = self.required(key)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]*", value):
+            raise RuntimeError(f"Secret {key} must be a safe RouterOS interface name")
+        return value
 
 
-def _host(key: str) -> str:
-    value = _required(key)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", value):
-        raise RuntimeError(f"Secret {key} must be a safe hostname or IP address")
-    return value
+def _infisical_values() -> ConfigValues:
+    return ConfigValues(_secrets.get)
 
 
-def _ssh_username(key: str) -> str:
-    value = _required(key)
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
-        raise RuntimeError(f"Secret {key} must be a safe SSH username")
-    return value
-
-
-def _script_path(key: str) -> str:
-    value = _required(key)
-    if not re.fullmatch(r"/[\w./-]+", value):
-        raise RuntimeError(f"Secret {key} must be an absolute safe script path")
-    return value
-
-
-def _mac_address(key: str) -> str:
-    value = _required(key).upper()
-    if not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", value):
-        raise RuntimeError(f"Secret {key} must be a colon-separated MAC address")
-    return value
-
-
-def _router_interface(key: str) -> str:
-    value = _required(key)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]*", value):
-        raise RuntimeError(f"Secret {key} must be a safe RouterOS interface name")
-    return value
+def _group_values(group: dict[str, str]) -> ConfigValues:
+    return ConfigValues(lambda key: group.get(key, ""))
 
 
 @dataclass(frozen=True)
@@ -216,6 +238,14 @@ class NetworkConfig:
 
 
 @dataclass(frozen=True)
+class TursoConfig:
+    database_url: str
+    auth_token: str
+    sync_interval_seconds: int
+    down_reminder_seconds: int
+
+
+@dataclass(frozen=True)
 class Config:
     discord: DiscordConfig
     edge: EdgeConfig
@@ -225,11 +255,37 @@ class Config:
     network: NetworkConfig
 
 
-def load_config() -> Config:
-    """Build immutable runtime configuration. No secret values are logged."""
-    ssh_key_path = _secrets.get("SSH_KEY_PATH").strip() or None
+def load_turso_config() -> TursoConfig:
+    """Read Turso connection/sync bootstrap values from Infisical.
 
-    anchor_raw = _secrets.get("NETWORK_ANCHOR_HOST").strip()
+    These four values must be available before the Turso local replica exists, so (per
+    migrations/turso_migrations.md §3) they stay on the existing Infisical bootstrap path rather
+    than living inside the Turso-backed data they are used to fetch.
+    """
+    v = _infisical_values()
+    return TursoConfig(
+        database_url=v.required("TURSO_DATABASE_URL"),
+        auth_token=v.required("TURSO_AUTH_TOKEN"),
+        sync_interval_seconds=v.positive_int("TURSO_DB_SYNC_INTERVAL") * 60,
+        down_reminder_seconds=v.positive_int("TURSO_DB_DOWN_REMINDER") * 60,
+    )
+
+
+def load_config(turso: ConfigSource) -> Config:
+    """Build immutable runtime configuration. No secret values are logged.
+
+    Discord and MikroTik identity still come from Infisical. Edge, NAS, and home-network
+    operational values (including the shared SSH key path) come from the Turso local replica in
+    ``turso``, which must already be bootstrapped by the caller before this runs.
+    """
+    v = _infisical_values()
+    edge = _group_values(turso.read_group("edge"))
+    nas = _group_values(turso.read_group("nas"))
+    home_network = _group_values(turso.read_group("home_network"))
+
+    ssh_key_path = home_network.optional("SSH_KEY_PATH") or None
+
+    anchor_raw = home_network.optional("NETWORK_ANCHOR_HOST")
     anchor_host = None
     if anchor_raw:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", anchor_raw):
@@ -238,50 +294,50 @@ def load_config() -> Config:
 
     return Config(
         discord=DiscordConfig(
-            bot_token=_required("DISCORD_BOT_TOKEN"),
-            guild_ids=_snowflake_list("DISCORD_GUILD_IDS"),
-            control_room_channel_id=_positive_int("DISCORD_CONTROL_ROOM_CHANNEL_ID"),
-            watchdog_channel_id=_positive_int("DISCORD_WATCHDOG_CHANNEL_ID"),
-            allowed_user_ids=_snowflake_list("DISCORD_ALLOWED_USER_IDS"),
+            bot_token=v.required("DISCORD_BOT_TOKEN"),
+            guild_ids=v.snowflake_list("DISCORD_GUILD_IDS"),
+            control_room_channel_id=v.positive_int("DISCORD_CONTROL_ROOM_CHANNEL_ID"),
+            watchdog_channel_id=v.positive_int("DISCORD_WATCHDOG_CHANNEL_ID"),
+            allowed_user_ids=v.snowflake_list("DISCORD_ALLOWED_USER_IDS"),
         ),
         edge=EdgeConfig(
-            internal_ip=_host("EDGE_INTERNAL_IP"),
-            ssh_port=_positive_int("EDGE_SSH_PORT", default=22),
-            ssh_user=_ssh_username("EDGE_SSH_USER"),
-            info_script=_script_path("EDGE_INFO_SCRIPT"),
+            internal_ip=edge.host("EDGE_INTERNAL_IP"),
+            ssh_port=edge.positive_int("EDGE_SSH_PORT", default=22),
+            ssh_user=edge.ssh_username("EDGE_SSH_USER"),
+            info_script=edge.script_path("EDGE_INFO_SCRIPT"),
         ),
         mikrotik=MikroTikConfig(
-            host=_host("MIKROTIK_HOST"),
-            port=_positive_int("MIKROTIK_PORT", default=22),
-            username=_ssh_username("MIKROTIK_USERNAME"),
+            host=v.host("MIKROTIK_HOST"),
+            port=v.positive_int("MIKROTIK_PORT", default=22),
+            username=v.ssh_username("MIKROTIK_USERNAME"),
             ssh_key_path=ssh_key_path,
         ),
         nas=NasConfig(
-            ip=_host("NAS_IP"),
-            mac=_mac_address("NAS_MAC"),
-            wol_interface=_router_interface("NAS_WOL_INTERFACE"),
-            ssh_host=_host("NAS_IP"),
-            ssh_port=_positive_int("NAS_SSH_PORT", default=22),
-            ssh_user=_ssh_username("NAS_USER"),
-            shutdown_script=_script_path("NAS_SHUTDOWN_SCRIPT"),
-            uptime_script=_script_path("NAS_UPTIME_SCRIPT"),
+            ip=nas.host("NAS_IP"),
+            mac=nas.mac_address("NAS_MAC"),
+            wol_interface=nas.router_interface("NAS_WOL_INTERFACE"),
+            ssh_host=nas.host("NAS_IP"),
+            ssh_port=nas.positive_int("NAS_SSH_PORT", default=22),
+            ssh_user=nas.ssh_username("NAS_USER"),
+            shutdown_script=nas.script_path("NAS_SHUTDOWN_SCRIPT"),
+            uptime_script=nas.script_path("NAS_UPTIME_SCRIPT"),
             ssh_key_path=ssh_key_path,
         ),
         nas_watchdog=NasWatchdogConfig(
-            check_interval_seconds=_positive_int("NAS_MONITOR_INTERVAL", default=60),
-            max_age_seconds=_positive_int("NAS_MAX_AGE_MINUTE") * 60,
-            reminder_interval_seconds=_positive_int("NAS_MAX_AGE_REMINDER_MINUTE") * 60,
+            check_interval_seconds=nas.positive_int("NAS_MONITOR_INTERVAL", default=60),
+            max_age_seconds=nas.positive_int("NAS_MAX_AGE_MINUTE") * 60,
+            reminder_interval_seconds=nas.positive_int("NAS_MAX_AGE_REMINDER_MINUTE") * 60,
         ),
         network=NetworkConfig(
-            host=_host("MIKROTIK_HOST"),
-            manual_probe_count=_positive_int("NETWORK_RECOVERY_PING_COUNT", default=5),
-            ping_timeout_seconds=_positive_int("NETWORK_PING_TIMEOUT", default=3),
-            watchdog_interval_seconds=_positive_int("TIMED_OUT_INTERVAL", default=10) * 60,
-            watchdog_probe_count=_positive_int("NETWORK_PING_COUNT", default=10),
-            watchdog_recovery_probe_count=_positive_int(
+            host=v.host("MIKROTIK_HOST"),
+            manual_probe_count=home_network.positive_int("NETWORK_RECOVERY_PING_COUNT", default=5),
+            ping_timeout_seconds=home_network.positive_int("NETWORK_PING_TIMEOUT", default=3),
+            watchdog_interval_seconds=home_network.positive_int("TIMED_OUT_INTERVAL", default=10) * 60,
+            watchdog_probe_count=home_network.positive_int("NETWORK_PING_COUNT", default=10),
+            watchdog_recovery_probe_count=home_network.positive_int(
                 "NETWORK_RECOVERY_PING_COUNT", default=5
             ),
             anchor_host=anchor_host,
-            confirm_delay_seconds=_non_negative_int("NETWORK_CONFIRM_DELAY", default=15),
+            confirm_delay_seconds=home_network.non_negative_int("NETWORK_CONFIRM_DELAY", default=15),
         ),
     )
