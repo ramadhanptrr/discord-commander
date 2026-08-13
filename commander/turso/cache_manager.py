@@ -171,16 +171,24 @@ class TursoCacheManager:
         # leading/trailing whitespace so a key like "EDGE_SSH_USER " still matches lookups.
         group = {str(row[0]).strip(): str(row[1]).strip() for row in rows}
 
-        # Key names (not values) are safe to log and make a missing/blank row diagnosable
-        # without reaching for a separate DB client.
+        # Key names (not values) are safe to log. This now runs on every action (live-read
+        # config), so routine reads stay at DEBUG; a blank value is still actionable and stays
+        # visible at WARNING regardless of LOG_LEVEL.
         blank_keys = sorted(key for key, value in group.items() if not str(value).strip())
-        logger.info(
-            "Turso group '%s' loaded %d key(s): %s%s",
-            identifier,
-            len(group),
-            sorted(group.keys()),
-            f" (blank value: {blank_keys})" if blank_keys else "",
-        )
+        if blank_keys:
+            logger.warning(
+                "Turso group '%s' loaded %d key(s) with blank value(s): %s",
+                identifier,
+                len(group),
+                blank_keys,
+            )
+        else:
+            logger.debug(
+                "Turso group '%s' loaded %d key(s): %s",
+                identifier,
+                len(group),
+                sorted(group.keys()),
+            )
         return group
 
     # -- periodic synchronization ---------------------------------------------------------
