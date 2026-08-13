@@ -167,7 +167,19 @@ class TursoCacheManager:
             raise RuntimeError("Turso local database is not ready; bootstrap() must run first")
 
         rows = self._connection.execute(SELECT_GROUP_BY_IDENTIFIER, (identifier,)).fetchall()
-        return {row[0]: row[1] for row in rows}
+        group = {row[0]: row[1] for row in rows}
+
+        # Key names (not values) are safe to log and make a missing/blank row diagnosable
+        # without reaching for a separate DB client.
+        blank_keys = sorted(key for key, value in group.items() if not str(value).strip())
+        logger.info(
+            "Turso group '%s' loaded %d key(s): %s%s",
+            identifier,
+            len(group),
+            sorted(group.keys()),
+            f" (blank value: {blank_keys})" if blank_keys else "",
+        )
+        return group
 
     # -- periodic synchronization ---------------------------------------------------------
 
