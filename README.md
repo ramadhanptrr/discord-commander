@@ -115,7 +115,7 @@ Compose environment file.
 | MikroTik | Infisical | `MIKROTIK_HOST`, `MIKROTIK_USERNAME` |
 | Turso connection/sync | Infisical | `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TURSO_DB_SYNC_INTERVAL`, `TURSO_DB_DOWN_REMINDER` |
 | NAS actions/watchdog | Turso (`nas`) | `NAS_IP`, `NAS_MAC`, `NAS_WOL_INTERFACE`, `NAS_USER`, `NAS_SHUTDOWN_SCRIPT`, `NAS_UPTIME_SCRIPT`, `NAS_MAX_AGE_MINUTE`, `NAS_MAX_AGE_REMINDER_MINUTE` |
-| Edge info | Turso (`edge`) | `EDGE_INTERNAL_IP`, `EDGE_SSH_USER`, `EDGE_INFO_SCRIPT` |
+| Edge info | Infisical (`EDGE_SSH_USER`) + Turso (`edge`) | `EDGE_SSH_USER`, `EDGE_INTERNAL_IP`, `EDGE_INFO_SCRIPT` |
 
 Ports, timing values, optional `SSH_KEY_PATH`, and all defaults are documented in the
 [configuration reference](./machine_lore/WORKFLOW.md#9-configuration-reference).
