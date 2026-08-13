@@ -123,16 +123,23 @@ class TursoCacheManager:
         logger.info("Turso database bootstrap completed successfully.")
 
     def _remove_existing_local_db(self) -> None:
-        if not self._local_db_path.exists():
+        parent = self._local_db_path.parent
+        if not parent.is_dir():
+            return
+
+        # The sync engine keeps more than just the main file next to it (WAL, and a "-info"
+        # sync-metadata file tracking synced_revision/client_unique_id, at least). Deleting only
+        # the main file leaves orphaned metadata that makes the next connect() fail with
+        # "main DB file doesn't exists, but metadata is" -- so remove everything that shares its
+        # name as a prefix rather than guessing exact companion suffixes.
+        matches = sorted(parent.glob(f"{self._local_db_path.name}*"))
+        if not matches:
             return
 
         logger.info("Removing existing Turso local database before startup bootstrap.")
         try:
-            self._local_db_path.unlink()
-            for suffix in ("-wal", "-shm"):
-                companion = self._local_db_path.with_name(self._local_db_path.name + suffix)
-                if companion.exists():
-                    companion.unlink()
+            for path in matches:
+                path.unlink()
         except OSError as error:
             raise TursoBootstrapError(
                 "Failed to remove the existing Turso local database before startup bootstrap."
