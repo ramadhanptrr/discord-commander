@@ -167,7 +167,9 @@ class TursoCacheManager:
             raise RuntimeError("Turso local database is not ready; bootstrap() must run first")
 
         rows = self._connection.execute(SELECT_GROUP_BY_IDENTIFIER, (identifier,)).fetchall()
-        group = {row[0]: row[1] for row in rows}
+        # attribute_key/attribute_value are hand-edited through a DB GUI; strip stray
+        # leading/trailing whitespace so a key like "EDGE_SSH_USER " still matches lookups.
+        group = {str(row[0]).strip(): str(row[1]).strip() for row in rows}
 
         # Key names (not values) are safe to log and make a missing/blank row diagnosable
         # without reaching for a separate DB client.
