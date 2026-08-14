@@ -46,7 +46,7 @@ def _code_block(value: str) -> str:
 
 class NetworkStatusSource(ConfigSource, EventHistorySource, Protocol):
     """Everything the manual ``/status net`` display needs from Turso: config plus watchdog state
-    Worker Pooling persisted to ``event_history`` and synced into the shared local replica."""
+    Worker Pooling persisted to ``event_history`` and Commander's own replica has since synced."""
 
 
 class OperatorOperations:

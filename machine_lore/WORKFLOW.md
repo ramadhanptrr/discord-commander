@@ -1,9 +1,10 @@
 # Discord Commander Workflow
 
-> Last reviewed: 2026-08-08
+> Last reviewed: 2026-08-14
 >
 > Scope: application startup, Discord routing, panel controls, device operations, watchdogs,
-> configuration, and deployment.
+> configuration, and deployment, across both the `discord-commander` and `worker-pooling`
+> containers.
 
 This document describes what the repository currently does. It does not make claims about the live
 VPS, Discord server permissions, WireGuard routes, MikroTik, NAS, edge host, or Infisical policy.
@@ -12,57 +13,88 @@ reliability gaps are in [AUDIT.md](./AUDIT.md).
 
 ## 1. Runtime overview
 
-One process has four sources of work:
+Two independent processes, from the same image, each with their own entrypoint:
+
+**Commander** (`commander.bot`, container `discord-commander`) has two sources of work:
 
 1. Guild-scoped Discord slash commands and control-panel button interactions.
-2. A background watchdog for home-network reachability.
-3. A background watchdog for NAS uptime.
-4. A background synchronization task for the Turso-backed configuration replica.
+2. Its own background synchronization task for its own Turso-backed configuration replica.
 
-All blocking network and SSH work is moved to a worker thread with `asyncio.to_thread()`. The
-Discord event loop remains responsible for interactions, embeds, and watchdog scheduling.
+**Worker Pooling** (`worker.main`, container `worker-pooling`) has three sources of work, none of
+them triggered by a user:
+
+1. A background watchdog for home-network reachability.
+2. A background watchdog for NAS uptime.
+3. A background synchronization task for its own Turso-backed configuration replica.
+
+In both processes, all blocking network and SSH work is moved to a worker thread with
+`asyncio.to_thread()`. Commander's event loop is responsible for interactions, embeds, and its
+sync task's scheduling; Worker's event loop is responsible for the two watchdogs' scheduling and
+its own sync task.
 
 ```text
-main()
+commander.bot.main()
   -> load_turso_config() from Infisical (Turso URL/token/sync intervals)
   -> TursoCacheManager.bootstrap(): delete any existing local replica, pull a fresh one from
-     Turso Cloud (fails startup on error/timeout)
+     Turso Cloud into Commander's own volume (fails startup on error/timeout)
   -> load_config(turso_cache): a one-time startup snapshot for Discord identity, MikroTik
      identity, and channel validation (edge/NAS/home-network values are NOT held from this
      snapshot -- see below)
   -> CommanderBot(config, turso_cache)
-       -> build authorization, controllers, state, limiter, and watchdogs -- each controller and
-          watchdog is handed the `TursoCacheManager` (a `ConfigSource`) itself, not a config value
-       -> attach the watchdog notifier to the Turso cache manager
+       -> build authorization, controllers, and state -- each controller is handed the
+          `TursoCacheManager` (a `ConfigSource`) itself, not a config value
        -> register guild slash-command groups and persistent panel view
   -> Bot.run()
        -> setup_hook(): validate configured Discord channels; sync commands to every allowed guild
-       -> on_ready(): start network, NAS-uptime, and Turso-sync watchdog tasks; send one startup
-          notification
+       -> on_ready(): start Commander's own Turso-sync task; send one startup notification
        -> Discord gateway: slash commands and button interactions
 ```
 
+```text
+worker.main.main()
+  -> load_turso_config() from Infisical (Turso URL/token/sync intervals)
+  -> TursoCacheManager.bootstrap(): delete any existing local replica, pull a fresh one from
+     Turso Cloud into Worker's own volume (fails startup on error/timeout)
+  -> TursoProdWriter(turso_config): lazy-connect write path for event_history, constructed only
+     here -- Commander has none
+  -> load_config(turso_cache): reused startup snapshot; Worker only actually needs
+     config.discord.bot_token / watchdog_channel_id / network.watchdog_interval_seconds from it
+  -> create_http_only_client(bot_token): logs in without opening a gateway session
+  -> DiscordWatchdogNotifier(discord_client, ...); attach_notifier() onto this Worker's own
+     TursoCacheManager (Commander's instance deliberately never gets one -- see §7.3)
+  -> build MikroTikClient / NetworkChecker / NasController, then NetworkWatchdog and
+     NasUptimeWatchdog
+  -> three independent asyncio tasks: network-watchdog, nas-uptime-watchdog, turso-sync
+  -> await SIGTERM/SIGINT
+       -> cancel all three tasks, await them
+       -> close the Turso cache manager, the Turso writer, and the Discord client
+```
+
 Discord identity (bot token, guild/channel/user IDs) and MikroTik host/port/username come from
-Infisical and are read once at startup into an immutable `Config` snapshot, so changing those still
-requires a container restart. Edge, NAS, and home-network values (including the shared SSH key path)
-are the opposite: every command and every watchdog tick calls `load_edge_config()` /
-`load_nas_config()` / `load_nas_watchdog_config()` / `load_network_config()` /
-`load_mikrotik_config()` (for the shared SSH key path) fresh against the local Turso replica file at
-the moment it runs. There is no in-memory copy of these values between actions. A value edited in
-Turso Cloud applies on the *next* action once the periodic sync (or a restart's fresh bootstrap) has
-pulled it into the local replica file -- no restart is needed for these groups. If a value is
-missing or fails validation at the moment an action reads it, that single action fails (command:
-a Discord error reply via the existing generic exception handling in `operations.py`; watchdog
-tick: logged and retried after a 60-second backoff) rather than crashing the process -- see
+Infisical and are read once at startup into an immutable `Config` snapshot **in both processes**,
+so changing those still requires restarting both containers. Edge, NAS, and home-network values
+(including the shared SSH key path) are the opposite: every command and every watchdog tick calls
+`load_edge_config()` / `load_nas_config()` / `load_nas_watchdog_config()` / `load_network_config()`
+/ `load_mikrotik_config()` (for the shared SSH key path) fresh against that process's own local
+Turso replica file at the moment it runs. There is no in-memory copy of these values between
+actions. A value edited in Turso Cloud applies on the *next* action in *each* process once that
+process's own periodic sync (or its next restart's fresh bootstrap) has pulled it into its replica
+file -- no restart is needed for these groups, but the two processes can briefly disagree with each
+other between their independent sync ticks. If a value is missing or fails validation at the
+moment an action reads it, that single action fails (Commander command: a Discord error reply via
+the existing generic exception handling in `operations.py`; Worker watchdog tick: logged and
+retried after a 60-second backoff) rather than crashing the process -- see
 [§9.2a](#92a-turso-connection-and-sync-values-infisical) and [§7.3](#73-turso-synchronization-watchdog).
 
 ## 2. Startup, command registration, and shutdown
 
-`commander.bot.main()` bootstraps the Turso local replica, then loads immutable configuration,
-before attempting a Discord connection. Missing/invalid Infisical values, a failed or timed-out
-Turso bootstrap, and invalid Turso-sourced values all stop startup without logging secret values
-(hardcoded bootstrap timeout: `BOOTSTRAP_TIMEOUT_SECONDS = 30` in
-`commander/turso/cache_manager.py`). The connect/pull call has no cooperative cancellation hook, so
+### 2.1 Commander
+
+`commander.bot.main()` bootstraps Commander's own Turso local replica, then loads immutable
+configuration, before attempting a Discord connection. Missing/invalid Infisical values, a failed
+or timed-out Turso bootstrap, and invalid Turso-sourced values all stop startup without logging
+secret values (hardcoded bootstrap timeout: `BOOTSTRAP_TIMEOUT_SECONDS = 30` in
+`shared/turso/cache_manager.py`). The connect/pull call has no cooperative cancellation hook, so
 the 30-second bound only stops *waiting* for it; the dedicated worker thread keeps running until
 pyturso's call actually returns, and a late-arriving connection is closed and discarded rather than
 adopted (see the docstring on `TursoCacheManager.bootstrap()`).
@@ -73,12 +105,9 @@ adopted (see the docstring on `TursoCacheManager.bootstrap()`).
 - `MikroTikClient`, `NasController`, and `EdgeController` for fixed SSH operations -- each holds
   the `TursoCacheManager` itself and reads its config group fresh on every call, not a config value;
 - `NetworkChecker` for direct container ICMP probes, same live-read pattern;
-- `PowerOperationState` to make wake and shutdown mutually exclusive;
-- `RateLimiter` for confirmed power actions;
-- `NetworkWatchdog` and `NasUptimeWatchdog` with a shared Discord notifier -- both re-read their
-  config (including their own tick interval) at the top of every tick;
-- a `TursoCacheManager` reference (already bootstrapped in `main()`), with the same Discord
-  notifier attached for DOWN/RECOVERED alerts.
+- `PowerOperationState` to make wake and shutdown mutually exclusive (Commander-local only; Worker
+  does not consult it -- see [ARCHITECTURE.md §8.4](./ARCHITECTURE.md#84-no-cross-process-wakeshutdown-coordination-by-design));
+- `RateLimiter` for confirmed power actions.
 
 During `setup_hook()` the bot registers a persistent `CommanderPanel`, validates both configured
 channels through Discord, and synchronizes every application command to each ID in
@@ -88,18 +117,39 @@ globally.
 Channel validation fails startup if either channel cannot be fetched, lies outside the allowed guild
 set, cannot receive messages, or if control room and watchdog channel use the same ID.
 
-`on_ready()` starts each watchdog once and sends one **Commander online** notification to the
-watchdog channel for the process lifetime. The in-memory startup flag prevents Discord reconnects
-from sending duplicate startup notifications; a new container/process has fresh memory and sends a
-new notification after it connects. `close()` cancels and awaits both watchdog tasks before closing
-the Discord client.
+`on_ready()` starts Commander's own Turso-sync task and sends one **Commander online** notification
+to the watchdog channel for the process lifetime. The in-memory startup flag prevents Discord
+reconnects from sending duplicate startup notifications; a new container/process has fresh memory
+and sends a new notification after it connects. `close()` cancels and awaits the sync task before
+closing the local Turso cache and the Discord client.
+
+### 2.2 Worker Pooling
+
+`worker.main.main()` bootstraps Worker's own Turso local replica (a separate volume from
+Commander's -- see [ARCHITECTURE.md §6](./ARCHITECTURE.md#6-configuration-and-secret-ownership)),
+constructs a `TursoProdWriter` (Worker is the only process that ever writes `event_history`), loads
+the same `Config` snapshot Commander does (reusing `load_config()` even though Worker only needs a
+few fields off it, to avoid a second config-loading code path), logs a Discord client in via
+`shared.discord_client.create_http_only_client()` (HTTP only -- no gateway session, since Worker
+never needs to receive anything from Discord), and attaches a `DiscordWatchdogNotifier` to its own
+`TursoCacheManager` so Turso DOWN/RECOVERED alerts are sent from Worker (Commander's own cache
+manager never gets a notifier attached, so the alert isn't sent twice -- see §7.3).
+
+It then starts three independent `asyncio` tasks -- `network-watchdog`, `nas-uptime-watchdog`,
+`turso-sync` -- and waits on a `SIGTERM`/`SIGINT`-triggered `asyncio.Event`. On shutdown it cancels
+and awaits all three tasks (one task's failure doesn't stop the others, since each is wrapped in its
+own try/except inside its `run()` loop -- see §7), then closes the Turso cache manager, the Turso
+writer, and the Discord client in that order.
+
+Worker registers no Discord commands and has no `setup_hook()`/channel-validation step of its own;
+it only ever sends to the already-known watchdog channel ID from its `Config` snapshot.
 
 ## 3. Discord entry points
 
 ### 3.1 Slash commands
 
-All slash commands are guild-scoped. Each command first applies the same authorization policy, then
-delegates to a shared `OperatorOperations` method.
+All slash commands are guild-scoped and handled entirely by Commander. Each command first applies
+the same authorization policy, then delegates to a shared `OperatorOperations` method.
 
 | Command | Action | Output destination |
 |---|---|---|
@@ -108,18 +158,19 @@ delegates to a shared `OperatorOperations` method.
 | `/help` | Shows the supported command list. | Control room |
 | `/ping` | Replies `Pong!`. | Control room |
 | `/status nas` | Checks NAS reachability through MikroTik. | Control room |
-| `/status net` | Probes the home gateway from the container. | Control room |
+| `/status net` | Probes the home gateway from the container; also shows Worker's last-persisted network-watchdog transition, read from Commander's own synced Turso replica. | Control room |
 | `/edge info` | Runs the fixed edge information script. | Control room |
 | `/wake nas` | Opens a requester-bound wake confirmation. | Control room |
 | `/shutdown nas` | Opens a requester-bound shutdown confirmation. | Control room |
 
 The commands are grouped in Discord as `status`, `edge`, `wake`, and `shutdown` where applicable.
-There is no text-command parser and no message-content listener.
+There is no text-command parser and no message-content listener. Worker registers no commands.
 
 ### 3.2 Persistent control panel
 
-`/start` and `/panel` create the same `CommanderPanel` with static component IDs. The bot registers
-one matching view at startup, allowing a previously sent panel to work after a container restart.
+`/start` and `/panel` create the same `CommanderPanel` with static component IDs. Commander
+registers one matching view at startup, allowing a previously sent panel to work after a Commander
+restart.
 
 | Row | Buttons | Behaviour |
 |---|---|---|
@@ -132,7 +183,7 @@ responses have the same output formatting and control-room destination.
 
 ### 3.3 Power confirmation buttons
 
-Wake and shutdown are intentionally two-step actions:
+Wake and shutdown are intentionally two-step actions, entirely within Commander:
 
 1. An authorized operator invokes `/wake nas`, `/shutdown nas`, or the matching panel button.
 2. Commander posts a public confirmation embed with **Confirm** and **Cancel**.
@@ -153,43 +204,51 @@ An interaction is accepted only when every condition below is true:
 - its user ID is present in `DISCORD_ALLOWED_USER_IDS`.
 
 Rejected interactions are logged with a reason and receive an ephemeral English denial. This means
-the watchdog channel cannot be used as a control surface, even by an allowed user.
+the watchdog channel cannot be used as a control surface, even by an allowed user -- and Worker
+doesn't listen for interactions at all, so there's nothing for it to authorize.
 
 Accepted manual results are public in the control room (`ephemeral=False`) so operators can see the
 operation history. Unhandled application-command errors are logged and receive an ephemeral generic
-response. The watchdog channel receives no manual messages.
+response. The watchdog channel receives no manual messages from either process.
 
 `DISCORD_WATCHDOG_CHANNEL_ID` is used exclusively by automatic lifecycle and watchdog
-notifications. Its alerts contain no interactive buttons and mention nobody
+notifications, from both containers. Its alerts contain no interactive buttons and mention nobody
 (`AllowedMentions.none()`).
 
 ## 5. Rate limiting and concurrency state
 
 ### 5.1 Rate limiting
 
-`RateLimiter` is an in-memory, per-user sliding window. The current implementation applies it to a
-confirmed power action only; status, edge-info, help, and ping are not rate limited.
+`RateLimiter` is an in-memory, per-user sliding window, owned by Commander. The current
+implementation applies it to a confirmed power action only; status, edge-info, help, and ping are
+not rate limited.
 
 | Operation | Limit | When a call is counted |
 |---|---|---|
 | Wake NAS | 2 confirmations per 120 seconds per user | After Confirm is clicked |
 | Shutdown NAS | 2 confirmations per 120 seconds per user | After Confirm is clicked |
 
-The state disappears on container restart. A user hitting a limit receives a public control-room
+The state disappears on a Commander restart. A user hitting a limit receives a public control-room
 reply with the retry delay. The current scope is documentation of the code, not a claim that all
 operations are uniformly throttled.
 
 ### 5.2 Power-operation lock
 
-`PowerOperationState` keeps one active operation name behind an `asyncio.Lock`. Wake and shutdown
-cannot overlap: a second confirmation while either operation is running receives a message asking
-the operator to wait. The lock is released in a `finally` block after success, failure, or an
-unexpected exception.
+`PowerOperationState`, owned by Commander, keeps one active operation name behind an `asyncio.Lock`.
+Wake and shutdown cannot overlap: a second confirmation while either operation is running receives
+a message asking the operator to wait. The lock is released in a `finally` block after success,
+failure, or an unexpected exception.
 
-The NAS uptime watchdog skips its tick while a wake or shutdown is active. The network watchdog does
-not skip because home-network reachability is independent of NAS power state.
+This lock is process-local to Commander and has no counterpart in Worker. The NAS uptime watchdog
+(now in Worker) does not consult it -- its ordinary online/uptime gating already covers the
+wake/shutdown window on its own, without needing any cross-process signal; see
+[ARCHITECTURE.md §8.4](./ARCHITECTURE.md#84-no-cross-process-wakeshutdown-coordination-by-design).
+The network watchdog never skipped for this reason either, since home-network reachability is
+independent of NAS power state.
 
 ## 6. Device workflows
+
+All of the following run in Commander; none of them run in Worker.
 
 ### 6.1 NAS status
 
@@ -212,11 +271,15 @@ slash command or panel button
   -> defer Discord response
   -> worker thread: local ping -c <manual-count> -i 1 -W <timeout> MIKROTIK_HOST
   -> green reachable or red unreachable embed
+  -> read the latest home_network event_history row from Commander's own synced Turso replica;
+     if Worker's watchdog currently considers the network DOWN, add how long
 ```
 
 The default manual count is `NETWORK_RECOVERY_PING_COUNT` (default `5`). A manual network check does
-not change watchdog state. If the watchdog already considers the network down, the result embeds how
-long that down state has been tracked.
+not change watchdog state (that state belongs entirely to Worker). If Worker's watchdog already
+considers the network down, the result embeds how long that down state has been tracked, based on
+whatever Commander's own replica has synced in -- this can lag Worker's live state by up to
+Commander's `TURSO_DB_SYNC_INTERVAL`.
 
 The image installs `iputils-ping`; lack of that binary, a ping timeout, or an unexpected subprocess
 failure is treated as unreachable by the low-level checker and logged.
@@ -248,6 +311,8 @@ After the two-step confirmation and power lock:
 6. It reports success with approximate elapsed boot time, or a timeout if NAS did not answer.
 
 WoL only requests wake-up; a successful RouterOS command is not proof that the NAS later booted.
+This entire flow, including its polling, runs inside the single Discord interaction in Commander --
+it is never handed off to Worker (see [ARCHITECTURE.md §1](./ARCHITECTURE.md#1-system-context)).
 
 ### 6.5 Shutdown NAS
 
@@ -263,15 +328,18 @@ After the two-step confirmation and power lock:
    longer than 3,000 characters, then releases the power lock.
 
 The offline result confirms loss of reachability from MikroTik; it is not a hardware power-sensor
-reading. The shutdown script remains the authoritative implementation of a graceful shutdown.
+reading. The shutdown script remains the authoritative implementation of a graceful shutdown. Like
+Wake, this whole flow (with its polling) stays in Commander.
 
 ## 7. Automatic watchdogs
 
+All three watchdogs below run in Worker (`worker/`); none run in Commander.
+
 ### 7.1 Home-network watchdog
 
-This watchdog asks whether the home gateway is reachable from the VPS/container, independent of NAS
-state. It is edge-triggered: it sends only on transition into DOWN and on transition back to
-RECOVERED.
+This watchdog (`worker.network_watchdog.NetworkWatchdog`) asks whether the home gateway is
+reachable from the VPS/container, independent of NAS state. It is edge-triggered: it sends only on
+transition into DOWN and on transition back to RECOVERED.
 
 ```text
 state UP
@@ -289,9 +357,11 @@ state DOWN
   -> reply received: send RECOVERED alert with measured downtime; clear DOWN state
 ```
 
-The state changes only after Discord notification delivery succeeds. A temporary Discord send error
-therefore leaves the prior state intact and permits the next tick to retry rather than silently
-losing an alert. The state itself is memory-only and resets on container restart.
+The state changes only after Discord notification delivery succeeds (via Worker's HTTP-only Discord
+client). A temporary Discord send error therefore leaves the prior state intact and permits the
+next tick to retry rather than silently losing an alert. The state itself is memory-only within
+Worker and resets on a Worker restart (subject to the Turso restore in
+[ARCHITECTURE.md §8.3](./ARCHITECTURE.md#83-watchdog-state-restore-worker)).
 
 The alert embeds show the target host, verification details, and recovery downtime. `NETWORK_ANCHOR_HOST`
 is an optional external control probe: it avoids declaring the home network down when the VPS itself
@@ -300,11 +370,11 @@ outage.
 
 ### 7.2 NAS uptime watchdog
 
-This watchdog reminds operators about a NAS that was left powered on longer than expected.
+This watchdog (`worker.nas_reminder.NasUptimeWatchdog`) reminds operators about a NAS that was left
+powered on longer than expected.
 
 ```text
 every NAS_MONITOR_INTERVAL seconds
-  -> skip if wake/shutdown is active
   -> MikroTik check: NAS online?
        -> offline: clear last reminder timestamp
        -> online: SSH to NAS and run NAS_UPTIME_SCRIPT without sudo
@@ -313,22 +383,30 @@ every NAS_MONITOR_INTERVAL seconds
             -> uptime at/above max age: send reminder if first or reminder interval elapsed
 ```
 
+There is no explicit "skip while wake/shutdown is active" branch (there was one before the
+Commander/Worker split, tied to an in-memory lock that can no longer exist across processes) -- see
+[ARCHITECTURE.md §8.4](./ARCHITECTURE.md#84-no-cross-process-wakeshutdown-coordination-by-design)
+for why the ordinary online/uptime gating above already covers that window on its own.
+
 The uptime script must print exactly a Unix epoch integer for the NAS boot time. It is intentionally
 run without `sudo`. The first reminder can arrive up to one monitor interval after the configured
 maximum age; later reminders use `NAS_MAX_AGE_REMINDER_MINUTE` while the NAS remains online.
 
 The notifier records a reminder only after sending succeeds. An offline NAS or an uptime below the
-threshold resets the reminder cycle. As with other in-memory state, a container restart forgets the
-last reminder timestamp; a still-online NAS already over its threshold can alert again after restart.
+threshold resets the reminder cycle. As with other in-memory state, a Worker restart forgets the
+last reminder timestamp (subject to the Turso restore in
+[ARCHITECTURE.md §8.3](./ARCHITECTURE.md#83-watchdog-state-restore-worker)); a still-online NAS
+already over its threshold can alert again after restart if the restore doesn't apply.
 
 ### 7.3 Turso synchronization watchdog
 
-This watchdog is not a home-device probe: it reports the health of the configuration replica
-itself (`commander/turso/cache_manager.py`), separate from the network and NAS watchdogs above.
+This exists **in both processes independently** -- it is not a home-device probe, but a report on
+the health of that process's own configuration replica (`shared/turso/cache_manager.py`), separate
+from the network and NAS watchdogs above.
 
 ```text
-every TURSO_DB_SYNC_INTERVAL minutes
-  -> pull the local replica from Turso Cloud
+every TURSO_DB_SYNC_INTERVAL minutes (per process)
+  -> pull that process's own local replica from Turso Cloud
        -> success while UP: remain silent, log only
        -> success while DOWN: refresh local replica; state UP; RECOVERED alert pending
        -> failure while UP: state DOWN; record down_since; DOWN alert pending
@@ -336,37 +414,48 @@ every TURSO_DB_SYNC_INTERVAL minutes
           TURSO_DB_DOWN_REMINDER minutes have elapsed since the last *delivered*
           DOWN/reminder alert; otherwise stay silent
        -> any tick with a DOWN/reminder/RECOVERED alert pending: attempt delivery
+          (Worker only -- see below)
 ```
 
-Turso health (UP/DOWN) and notification-delivery state are tracked separately
-(`commander/turso/cache_manager.py`): health always reflects the actual sync result on this tick,
-but a DOWN, reminder, or RECOVERED alert only clears its "pending" flag once the Discord send
-actually succeeds. A failed send is logged and retried on the *next* sync tick with the same
-message (an unsent initial DOWN alert is retried as DOWN, not silently escalated to a reminder);
-health itself is never faked to make a notification retry happen, and a pending RECOVERED alert
-survives a failed send without reverting the already-correct UP state. A sync failure never stops
-Commander and never deletes the local replica: `read_group()` calls made by an in-flight action
-keep returning whatever the local replica file currently holds (see §1). The sync task exists to
-(a) keep the on-disk replica fresh so every subsequent `load_edge_config()` / `load_nas_config()` /
-`load_network_config()` call (and the *next* container restart's fresh bootstrap) sees current
-data, and (b) alert operators when Turso Cloud itself is unreachable. Since
+Turso health (UP/DOWN) and notification-delivery state are tracked separately per process
+(`shared/turso/cache_manager.py`): health always reflects that process's own actual sync result on
+this tick, but a DOWN, reminder, or RECOVERED alert only clears its "pending" flag once the Discord
+send actually succeeds. **Only Worker's `TursoCacheManager` has a notifier attached** -- Commander's
+own instance tracks health/pending state identically but never has anything to send, so a Turso
+Cloud outage (which affects both processes' sync at the same instant) produces exactly one alert,
+not two. A failed send is logged and retried on the *next* sync tick with the same message (an
+unsent initial DOWN alert is retried as DOWN, not silently escalated to a reminder); health itself
+is never faked to make a notification retry happen, and a pending RECOVERED alert survives a failed
+send without reverting the already-correct UP state.
+
+A sync failure never stops either process and never deletes that process's local replica:
+`read_group()` calls made by an in-flight action keep returning whatever that process's local
+replica file currently holds (see §1). Each process's sync task exists to (a) keep its own on-disk
+replica fresh so every subsequent `load_edge_config()` / `load_nas_config()` / `load_network_config()`
+call in that process (and that container's *next* restart's fresh bootstrap) sees current data, and
+(b) let Worker alert operators when Turso Cloud itself is unreachable. Since
 `EdgeConfig`/`NasConfig`/`NetworkConfig` values are read fresh on every action rather than held in
-`Config` after startup, a Turso Cloud edit applies as soon as the periodic sync has pulled it in --
-no restart required. Discord identity and MikroTik host/port/username (Infisical) are the exception:
-those are still read once into `Config` at startup and do require a restart (`AUDIT.md` CFG-01).
+`Config` after startup, a Turso Cloud edit applies to each process as soon as *that process's*
+periodic sync has pulled it in -- no restart required, though the two processes can briefly
+disagree between their independent sync ticks. Discord identity and MikroTik host/port/username
+(Infisical) are the exception: those are still read once into `Config` at startup in both processes
+and do require restarting both containers (`AUDIT.md` CFG-01).
 
 ## 8. SSH execution and output rules
 
 All subprocesses use argv lists rather than a local shell. Remote values are configuration-derived
 and validated before startup.
 
-| Target/action | Remote operation | SSH process timeout | Explicit identity |
-|---|---|---:|---|
-| MikroTik NAS check | `/ping address=<NAS_IP> count=1` | 15 seconds | Optional `SSH_KEY_PATH` |
-| MikroTik WoL | `/tool wol interface="<NAS_WOL_INTERFACE>" mac=<NAS_MAC>` | 15 seconds | Optional `SSH_KEY_PATH` |
-| NAS shutdown | `sudo <NAS_SHUTDOWN_SCRIPT>` | 180 seconds | Optional `SSH_KEY_PATH` |
-| NAS uptime | `<NAS_UPTIME_SCRIPT>` (no sudo) | 15 seconds | Optional `SSH_KEY_PATH` |
-| Edge information | `<EDGE_INFO_SCRIPT>` | 60 seconds | OpenSSH default identities |
+| Target/action | Remote operation | SSH process timeout | Explicit identity | Runs in |
+|---|---|---:|---|---|
+| MikroTik NAS check | `/ping address=<NAS_IP> count=1` | 15 seconds | Optional `SSH_KEY_PATH` | Commander, Worker |
+| MikroTik WoL | `/tool wol interface="<NAS_WOL_INTERFACE>" mac=<NAS_MAC>` | 15 seconds | Optional `SSH_KEY_PATH` | Commander |
+| NAS shutdown | `sudo <NAS_SHUTDOWN_SCRIPT>` | 180 seconds | Optional `SSH_KEY_PATH` | Commander |
+| NAS uptime | `<NAS_UPTIME_SCRIPT>` (no sudo) | 15 seconds | Optional `SSH_KEY_PATH` | Worker |
+| Edge information | `<EDGE_INFO_SCRIPT>` | 60 seconds | OpenSSH default identities | Commander |
+
+The MikroTik NAS check runs from both containers: Commander for `/status nas`, Wake, and Shutdown;
+Worker for both watchdogs' reachability gating.
 
 All current SSH clients use `StrictHostKeyChecking=accept-new` with
 `UserKnownHostsFile=/dev/null`; the consequences and required hardening are documented in
@@ -376,6 +465,8 @@ All current SSH clients use `StrictHostKeyChecking=accept-new` with
 
 ### 9.1 Bootstrap environment and Docker secrets
 
+Both containers read the same set of bootstrap environment variables and Docker secrets.
+
 | Environment variable | Required | Default | Purpose |
 |---|---|---|---|
 | `INFISICAL_CLIENT_ID_FILE` | Yes | — | Docker-secret path for Universal Auth client ID. |
@@ -384,43 +475,48 @@ All current SSH clients use `StrictHostKeyChecking=accept-new` with
 | `INFISICAL_ENVIRONMENT` | No | `prod` | Infisical environment slug. |
 | `INFISICAL_SECRET_PATH` | No | `/` | Infisical secret path. |
 | `LOG_LEVEL` | No | `INFO` | Python console log level. |
-| `TURSO_LOCAL_DB_PATH` | No | `/data/turso/local.db` | Path to the local Turso replica file; deleted and rebuilt on every startup (§7.3). Mounted as the `commander_turso_data` Compose volume. |
+| `TURSO_LOCAL_DB_PATH` | No | `/data/turso/local.db` | Path to that container's own local Turso replica file; deleted and rebuilt on every startup (§7.3). Mounted as the `commander_turso_data` Compose volume in the `commander` service, `worker_turso_data` in the `worker` service -- the two are never shared (see [ARCHITECTURE.md §6](./ARCHITECTURE.md#6-configuration-and-secret-ownership)). |
 
-The Compose file mounts the three required bootstrap values from `~/secrets/infisical/` on the VPS.
-Discord and MikroTik application configuration is read from Infisical; edge/NAS/home-network
-application configuration is read from the Turso replica at `TURSO_LOCAL_DB_PATH` once
-`TursoCacheManager.bootstrap()` has populated it (§9.2a, §9.3, §9.4) — none of it comes from Compose
-variables.
+The Compose file mounts the three required bootstrap values from `~/secrets/infisical/` on the VPS,
+into both services. Discord and MikroTik application configuration is read from Infisical by both
+processes; edge/NAS/home-network application configuration is read from each process's own Turso
+replica at `TURSO_LOCAL_DB_PATH` once its own `TursoCacheManager.bootstrap()` has populated it
+(§9.2a, §9.3, §9.4) — none of it comes from Compose variables.
 
 ### 9.2 Discord application values
 
+Read by both processes' `load_config()` at startup, though Worker only actually uses
+`bot_token`/`watchdog_channel_id` out of this group.
+
 | Secret | Required | Format/meaning |
 |---|---|---|
-| `DISCORD_BOT_TOKEN` | Yes | Bot token. Never log or commit it. |
-| `DISCORD_GUILD_IDS` | Yes | One or more positive guild snowflakes, comma-separated. |
-| `DISCORD_CONTROL_ROOM_CHANNEL_ID` | Yes | Positive channel snowflake for all commands, buttons, and manual replies. |
-| `DISCORD_WATCHDOG_CHANNEL_ID` | Yes | Positive channel snowflake for automated alerts only; must differ from control room. |
-| `DISCORD_ALLOWED_USER_IDS` | Yes | One or more positive user snowflakes, comma-separated. |
+| `DISCORD_BOT_TOKEN` | Yes | Bot token. Never log or commit it. Commander uses it for a full gateway session; Worker uses it for an HTTP-only login (`shared.discord_client.create_http_only_client`). |
+| `DISCORD_GUILD_IDS` | Yes | One or more positive guild snowflakes, comma-separated. Commander-only use (command sync/authorization). |
+| `DISCORD_CONTROL_ROOM_CHANNEL_ID` | Yes | Positive channel snowflake for all commands, buttons, and manual replies. Commander-only use. |
+| `DISCORD_WATCHDOG_CHANNEL_ID` | Yes | Positive channel snowflake for automated alerts only; must differ from control room. Used by both processes. |
+| `DISCORD_ALLOWED_USER_IDS` | Yes | One or more positive user snowflakes, comma-separated. Commander-only use. |
 
 ### 9.2a Turso connection and sync values (Infisical)
 
-These four values must exist before the Turso replica does, so they stay on the Infisical path
-rather than living inside the data they are used to fetch (`commander/config.py:load_turso_config`).
+These four values must exist before either process's own Turso replica does, so they stay on the
+Infisical path rather than living inside the data they are used to fetch
+(`shared/config.py:load_turso_config`). Read independently by both processes at startup.
 
 | Secret | Required/default | Format/meaning |
 |---|---|---|
 | `TURSO_DATABASE_URL` | Yes | libSQL/Turso Cloud database URL (`remote_url` for `turso.sync.connect`). |
 | `TURSO_AUTH_TOKEN` | Yes | Turso auth token. Never log or commit it. |
-| `TURSO_DB_SYNC_INTERVAL` | Yes | Positive integer **minutes** between periodic replica syncs (§7.3). |
-| `TURSO_DB_DOWN_REMINDER` | Yes | Positive integer **minutes** between DOWN reminder alerts while Turso stays unreachable (§7.3). |
+| `TURSO_DB_SYNC_INTERVAL` | Yes | Positive integer **minutes** between periodic replica syncs (§7.3), applied independently in each process. |
+| `TURSO_DB_DOWN_REMINDER` | Yes | Positive integer **minutes** between DOWN reminder alerts while Turso stays unreachable (§7.3); only observable via Worker's alerts. |
 
 ### 9.3 Device and operation values
 
 MikroTik identity stays on Infisical (it is the SSH target used to reach the rest of the home
-network, not itself managed through Turso) and is read once at startup. Edge, NAS, and
-home-network values come from the Turso replica and are read fresh on every action via
-`TursoCacheManager.read_group(identifier)` against the `master_configurations` table, grouped by
-the `identifier` column shown below -- no restart needed for these to take effect once synced.
+network, not itself managed through Turso) and is read once at startup by both processes. Edge,
+NAS, and home-network values come from each process's own Turso replica and are read fresh on every
+action via `TursoCacheManager.read_group(identifier)` against the `master_configurations` table,
+grouped by the `identifier` column shown below -- no restart needed for these to take effect once
+that process has synced.
 
 The `master_configurations` schema is owned in Turso Cloud, not by a migration in this repository
 (there is no `.sql`/schema-migration file here). `read_group()` rejects a duplicate normalized
@@ -437,72 +533,83 @@ recommendation to enforce there, not something this repository can migrate itsel
 
 | Value | Source | Required/default | Consumer |
 |---|---|---|---|
-| `MIKROTIK_HOST` | Infisical | Required safe hostname/IP | MikroTik SSH target and direct home-network probe target. |
-| `MIKROTIK_PORT` | Infisical | Optional; `22` | MikroTik SSH port. |
-| `MIKROTIK_USERNAME` | Infisical | Required safe SSH username | MikroTik SSH account. |
-| `NAS_IP` | Turso (`nas`) | Required safe hostname/IP | NAS address for MikroTik status checks and direct NAS SSH. |
-| `NAS_MAC` | Turso (`nas`) | Required colon-separated MAC | Wake-on-LAN target. |
-| `NAS_WOL_INTERFACE` | Turso (`nas`) | Required safe RouterOS interface name | Interface passed to RouterOS WoL. Spaces and common interface punctuation are accepted; quotes/control characters are not. |
-| `NAS_SSH_PORT` | Turso (`nas`) | Optional; `22` | NAS SSH port. |
-| `NAS_USER` | Turso (`nas`) | Required safe SSH username | NAS SSH account. |
-| `NAS_SHUTDOWN_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed privileged script invoked by shutdown. |
-| `NAS_UPTIME_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed unprivileged script that prints boot epoch. |
-| `EDGE_INTERNAL_IP` | Turso (`edge`) | Required safe hostname/IP | Edge host SSH target. |
-| `EDGE_SSH_PORT` | Turso (`edge`) | Optional; `22` | Edge host SSH port. |
-| `EDGE_SSH_USER` | Turso (`edge`) | Required safe SSH username | Edge host SSH account. |
-| `EDGE_INFO_SCRIPT` | Turso (`edge`) | Required safe absolute path | Fixed edge information script. |
-| `SSH_KEY_PATH` | Turso (`home_network`) | Optional | Explicit SSH identity used by MikroTik and NAS operations. Edge SSH relies on OpenSSH's default identity selection. |
+| `MIKROTIK_HOST` | Infisical | Required safe hostname/IP | MikroTik SSH target and direct home-network probe target. Commander and Worker. |
+| `MIKROTIK_PORT` | Infisical | Optional; `22` | MikroTik SSH port. Commander and Worker. |
+| `MIKROTIK_USERNAME` | Infisical | Required safe SSH username | MikroTik SSH account. Commander and Worker. |
+| `NAS_IP` | Turso (`nas`) | Required safe hostname/IP | NAS address for MikroTik status checks and direct NAS SSH. Commander (status/wake/shutdown) and Worker (uptime reminder). |
+| `NAS_MAC` | Turso (`nas`) | Required colon-separated MAC | Wake-on-LAN target. Commander only. |
+| `NAS_WOL_INTERFACE` | Turso (`nas`) | Required safe RouterOS interface name | Interface passed to RouterOS WoL. Spaces and common interface punctuation are accepted; quotes/control characters are not. Commander only. |
+| `NAS_SSH_PORT` | Turso (`nas`) | Optional; `22` | NAS SSH port. Commander and Worker. |
+| `NAS_USER` | Turso (`nas`) | Required safe SSH username | NAS SSH account. Commander and Worker. |
+| `NAS_SHUTDOWN_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed privileged script invoked by shutdown. Commander only. |
+| `NAS_UPTIME_SCRIPT` | Turso (`nas`) | Required safe absolute path | Fixed unprivileged script that prints boot epoch. Worker only. |
+| `EDGE_INTERNAL_IP` | Turso (`edge`) | Required safe hostname/IP | Edge host SSH target. Commander only. |
+| `EDGE_SSH_PORT` | Turso (`edge`) | Optional; `22` | Edge host SSH port. Commander only. |
+| `EDGE_SSH_USER` | Turso (`edge`) | Required safe SSH username | Edge host SSH account. Commander only. |
+| `EDGE_INFO_SCRIPT` | Turso (`edge`) | Required safe absolute path | Fixed edge information script. Commander only. |
+| `SSH_KEY_PATH` | Turso (`home_network`) | Optional | Explicit SSH identity used by MikroTik and NAS operations, in both processes. Edge SSH relies on OpenSSH's default identity selection. |
 
 ### 9.4 Watchdog and probe values
 
-| Value | Source | Required/default | Unit and behaviour |
-|---|---|---|---|
-| `NAS_MONITOR_INTERVAL` | Turso (`nas`) | Optional; `60` | Positive seconds between NAS uptime ticks. |
-| `NAS_MAX_AGE_MINUTE` | Turso (`nas`) | Required | Positive minutes before first NAS-online reminder. |
-| `NAS_MAX_AGE_REMINDER_MINUTE` | Turso (`nas`) | Required | Positive minutes between NAS-online reminders. |
-| `TIMED_OUT_INTERVAL` | Turso (`home_network`) | Optional; `10` | Positive minutes between home-network watchdog ticks. |
-| `NETWORK_PING_COUNT` | Turso (`home_network`) | Optional; `10` | Positive probe count for DOWN detection and confirmation. |
-| `NETWORK_RECOVERY_PING_COUNT` | Turso (`home_network`) | Optional; `5` | Positive probe count for recovery and manual status checks. |
-| `NETWORK_PING_TIMEOUT` | Turso (`home_network`) | Optional; `3` | Positive seconds waited per ICMP probe. |
-| `NETWORK_ANCHOR_HOST` | Turso (`home_network`) | Optional; disabled when empty | Safe hostname/IP used as the VPS uplink control probe. |
-| `NETWORK_CONFIRM_DELAY` | Turso (`home_network`) | Optional; `15` | Non-negative seconds before a second outage check. `0` disables the delay/confirmation round. |
-| `ENABLE_STARTUP_NOTIFICATION` | Turso (`internal`) | Optional; `TRUE` | `TRUE`/`FALSE`. Whether Commander posts the "Commander online" message to the watchdog channel after each restart. |
+All read from each process's own Turso replica.
+
+| Value | Source | Required/default | Unit and behaviour | Consumer |
+|---|---|---|---|---|
+| `NAS_MONITOR_INTERVAL` | Turso (`nas`) | Optional; `60` | Positive seconds between NAS uptime ticks. | Worker only |
+| `NAS_MAX_AGE_MINUTE` | Turso (`nas`) | Required | Positive minutes before first NAS-online reminder. | Worker only |
+| `NAS_MAX_AGE_REMINDER_MINUTE` | Turso (`nas`) | Required | Positive minutes between NAS-online reminders. | Worker only |
+| `TIMED_OUT_INTERVAL` | Turso (`home_network`) | Optional; `10` | Positive minutes between home-network watchdog ticks. | Worker only |
+| `NETWORK_PING_COUNT` | Turso (`home_network`) | Optional; `10` | Positive probe count for DOWN detection and confirmation. | Worker only |
+| `NETWORK_RECOVERY_PING_COUNT` | Turso (`home_network`) | Optional; `5` | Positive probe count for recovery checks and the default manual-status probe count. | Commander and Worker |
+| `NETWORK_PING_TIMEOUT` | Turso (`home_network`) | Optional; `3` | Positive seconds waited per ICMP probe. | Commander and Worker |
+| `NETWORK_ANCHOR_HOST` | Turso (`home_network`) | Optional; disabled when empty | Safe hostname/IP used as the VPS uplink control probe. | Worker only |
+| `NETWORK_CONFIRM_DELAY` | Turso (`home_network`) | Optional; `15` | Non-negative seconds before a second outage check. `0` disables the delay/confirmation round. | Worker only |
+| `ENABLE_STARTUP_NOTIFICATION` | Turso (`internal`) | Optional; `TRUE` | `TRUE`/`FALSE`. Whether Commander posts the "Commander online" message to the watchdog channel after each restart. | Commander only |
 
 ## 10. Logging and failure handling
 
-The `commander` logger writes timestamped records to stdout at `LOG_LEVEL`. It logs startup summary,
-application-command sync counts, watchdog configuration, expected operation failures, authorization
-rejections, and unexpected exceptions. It is designed not to log Infisical secret values, and the
-Turso cache manager is designed not to log `TURSO_AUTH_TOKEN` or any connection string containing it.
+Commander's process writes timestamped records to stdout at `LOG_LEVEL` under the `"commander"`
+logger (plus module loggers like `commander.operations`, `shared.turso`, etc.); Worker's process
+does the same under the `"worker"` logger (plus `worker.network_watchdog`,
+`worker.nas_reminder`, `shared.turso`, etc.). Both log startup summary, watchdog/sync configuration
+where applicable, expected operation failures, and unexpected exceptions. Commander additionally
+logs application-command sync counts and authorization rejections. Neither is designed to log
+Infisical secret values, and the Turso cache manager (shared by both) is designed not to log
+`TURSO_AUTH_TOKEN` or any connection string containing it.
 
-Expected SSH/ping failures are rendered as English Discord embeds or script-output attachments in
-the control room. Watchdog tick failures are logged and do not terminate their background loop.
+Expected SSH/ping failures in Commander are rendered as English Discord embeds or script-output
+attachments in the control room. Watchdog tick failures in Worker are logged and do not terminate
+their background loop -- each of the three tasks (`network-watchdog`, `nas-uptime-watchdog`,
+`turso-sync`) wraps its own body in try/except, so one task's unexpected exception can't take down
+another.
 
 ## 11. VPS deployment and smoke test
 
-The authoritative runtime is the VPS container. Local bot execution is intentionally not required for
-this repository. Build and smoke test on the VPS after code changes:
+The authoritative runtime is the VPS, running both containers. Local execution is intentionally not
+required for this repository. Build and smoke test on the VPS after code changes:
 
 ```bash
 git pull
 docker compose build
 docker compose up -d
 docker compose ps
-docker compose logs --tail=100 -f
+docker compose logs --tail=100 -f commander
+docker compose logs --tail=100 -f worker
 ```
 
-A Turso-row change to an edge/NAS/home-network value needs no restart: it applies once the periodic
-sync (or a manual wait of up to `TURSO_DB_SYNC_INTERVAL`) has pulled it into the local replica (§1,
-§7.3). An Infisical-only change (Discord identity, MikroTik host/port/username, or the Turso
-connection/sync values themselves) still needs `docker compose restart commander` rather than a
-rebuild, since those are only read once at startup.
+A Turso-row change to an edge/NAS/home-network value needs no restart: it applies to each process
+once that process's own periodic sync (or a manual wait of up to `TURSO_DB_SYNC_INTERVAL`) has
+pulled it into its replica (§1, §7.3) -- the two processes can briefly disagree between their
+independent sync ticks. An Infisical-only change (Discord identity, MikroTik host/port/username, or
+the Turso connection/sync values themselves) still needs `docker compose restart commander worker`
+rather than a rebuild, since those are only read once at startup in both processes.
 
-Smoke-test sequence:
+### 11.1 Commander smoke test
 
 1. Confirm the `commander` container stays running in `docker compose ps`.
-2. Inspect startup logs for: Turso local-database removal (only present on a restart with a prior
-   replica), successful Turso bootstrap, missing/invalid secret errors, successful command sync, and
-   all three watchdog startup lines (network, NAS uptime, Turso sync).
+2. Inspect Commander's startup logs for: Turso local-database removal (only present on a restart
+   with a prior replica), successful Turso bootstrap, missing/invalid secret errors, and successful
+   command sync.
 3. Confirm the bot appears online in each intended Discord guild and slash commands are visible in
    the control room.
 4. From an allowed user in the control room, use `/ping` and `/help`.
@@ -512,21 +619,55 @@ Smoke-test sequence:
    watchdog channel.
 7. Confirm an unapproved user, wrong channel, or DM gets a private denial and cannot execute an
    operation.
-8. Confirm `/wake nas` and `/shutdown nas` show a requester-bound 60-second confirmation. Exercise
-   actual power operations only in a safe maintenance window.
-9. Verify an automatic watchdog alert is delivered to the dedicated watchdog channel under a planned
-   test condition; do not use a production outage as the test procedure.
-10. Verify Turso DOWN/RECOVERED alerts under a planned condition (e.g. temporarily revoke the Turso
-    auth token, wait for the next `TURSO_DB_SYNC_INTERVAL` tick, confirm the DOWN alert, restore the
-    token, confirm RECOVERED on the next tick) — not by relying on an actual Turso Cloud outage.
-11. Verify live-reload for a Turso-backed value: edit a low-risk value (e.g. `EDGE_INFO_SCRIPT`'s
-    contents, not the path itself) in Turso Studio, wait past the next `TURSO_DB_SYNC_INTERVAL` tick,
-    then run `/edge info` again **without restarting the container** and confirm the new behaviour
-    is reflected. Also confirm that setting an edge/NAS/home-network value to something invalid
-    (e.g. a space in `EDGE_SSH_USER`) makes only that one command fail with a Discord error reply,
-    without crashing the bot or other commands.
+8. Confirm `/wake nas` and `/shutdown nas` show a requester-bound 60-second confirmation, and that
+   the whole flow (including polling until UP/offline) completes without ever touching the `worker`
+   container. Exercise actual power operations only in a safe maintenance window.
 
-The Docker image contains `openssh-client` and `iputils-ping`. If network status unexpectedly fails
-after an image rebuild, the focused diagnostic is `docker compose exec commander ping -c 1
-<MIKROTIK_HOST>` from the VPS.
+### 11.2 Worker smoke test
 
+1. Confirm the `worker` container stays running in `docker compose ps`.
+2. Inspect Worker's startup logs for: successful Turso bootstrap, "Network watchdog started", "NAS
+   uptime watchdog started", and no import/connection errors.
+3. Verify an automatic network-watchdog alert is delivered to the dedicated watchdog channel under a
+   planned test condition; do not use a production outage as the test procedure.
+4. Verify a NAS-uptime reminder is delivered under a planned condition (leave a test NAS on past its
+   configured threshold, or temporarily lower `NAS_MAX_AGE_MINUTE` in Turso Studio and confirm it
+   applies without restarting `worker`).
+5. Verify Turso DOWN/RECOVERED alerts under a planned condition (e.g. temporarily revoke the Turso
+   auth token, wait for the next `TURSO_DB_SYNC_INTERVAL` tick, confirm exactly one DOWN alert from
+   `worker`, restore the token, confirm exactly one RECOVERED alert on the next tick) — not by
+   relying on an actual Turso Cloud outage, and confirm `commander`'s logs show the same sync
+   failure/recovery without posting a second alert.
+6. Verify live-reload for a Turso-backed watchdog value: edit a low-risk value (e.g.
+   `NAS_MAX_AGE_REMINDER_MINUTE`) in Turso Studio, wait past the next `TURSO_DB_SYNC_INTERVAL` tick,
+   and confirm the new behaviour is reflected **without restarting** `worker`.
+
+### 11.3 Isolation smoke test
+
+This is the main acceptance test for the two-container split
+([ARCHITECTURE.md §8.1](./ARCHITECTURE.md#81-failure-isolation-between-containers)).
+
+```bash
+docker compose restart worker
+```
+
+Confirm `commander` stays connected and `/ping`, `/status nas`, `/status net` keep responding
+throughout.
+
+```bash
+docker compose restart commander
+```
+
+Confirm `worker`'s logs show its watchdog ticks continuing uninterrupted (network and NAS-uptime),
+and that a watchdog-channel alert can still be triggered while `commander` is restarting.
+
+### 11.4 General
+
+Verify that setting an edge/NAS/home-network value to something invalid (e.g. a space in
+`EDGE_SSH_USER`) makes only that one command fail with a Discord error reply in Commander, without
+crashing either container or affecting other commands/watchdog ticks.
+
+The Docker image contains `openssh-client` and `iputils-ping`, available to both containers. If
+network status unexpectedly fails after an image rebuild, the focused diagnostic is
+`docker compose exec commander ping -c 1 <MIKROTIK_HOST>` (or `exec worker` for the watchdog side)
+from the VPS.

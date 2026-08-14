@@ -49,9 +49,9 @@ async def _shutdown(
 async def main() -> None:
     turso_config = load_turso_config()
     turso_cache = TursoCacheManager(turso_config, TURSO_LOCAL_DB_PATH)
-    # Worker Pooling is the sole owner of the shared local replica: it bootstraps it fresh on every
-    # process start and is the only process that ever syncs it afterward. Commander only ever opens
-    # read-only local connections against the same file. See migrations/worker_split_shared_cache.md.
+    # Worker Pooling owns its own local replica, independent of Commander's -- each process
+    # bootstraps and syncs its own copy from Turso Cloud rather than sharing one file. See
+    # migrations/worker_split_shared_cache.md for why a shared replica doesn't work with pyturso.
     await turso_cache.bootstrap()
     turso_writer = TursoProdWriter(turso_config)
 
@@ -63,7 +63,8 @@ async def main() -> None:
         config.network.watchdog_interval_seconds,
     )
     # Worker also owns Turso DOWN/RECOVERED alerting -- Commander deliberately does not attach a
-    # notifier to its own (read-only) cache manager instance, so the alert isn't sent twice.
+    # notifier to its own cache manager instance, even though it syncs independently too, so the
+    # alert isn't sent twice.
     turso_cache.attach_notifier(notifier)
 
     mikrotik = MikroTikClient(turso_cache)
