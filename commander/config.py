@@ -121,6 +121,18 @@ class ConfigValues:
             raise RuntimeError(f"Secret {key} must be zero or a positive integer")
         return value
 
+    def boolean(self, key: str, default: bool) -> bool:
+        raw = self.optional(key)
+        if not raw:
+            return default
+
+        normalized = raw.upper()
+        if normalized == "TRUE":
+            return True
+        if normalized == "FALSE":
+            return False
+        raise RuntimeError(f"Secret {key} must be TRUE or FALSE")
+
     def snowflake_list(self, key: str) -> frozenset[int]:
         raw = self.required(key)
         values: set[int] = set()
@@ -238,6 +250,11 @@ class NetworkConfig:
 
 
 @dataclass(frozen=True)
+class InternalConfig:
+    enable_startup_notification: bool
+
+
+@dataclass(frozen=True)
 class TursoConfig:
     database_url: str
     auth_token: str
@@ -253,6 +270,7 @@ class Config:
     nas: NasConfig
     nas_watchdog: NasWatchdogConfig
     network: NetworkConfig
+    internal: InternalConfig
 
 
 def load_turso_config() -> TursoConfig:
@@ -350,6 +368,14 @@ def load_network_config(turso: ConfigSource) -> NetworkConfig:
     )
 
 
+def load_internal_config(turso: ConfigSource) -> InternalConfig:
+    """Read the ``internal`` group (bot-lifecycle switches, not tied to any device/network) fresh."""
+    internal = _group_values(turso.read_group("internal"))
+    return InternalConfig(
+        enable_startup_notification=internal.boolean("ENABLE_STARTUP_NOTIFICATION", default=True),
+    )
+
+
 def load_config(turso: ConfigSource) -> Config:
     """Build the startup configuration snapshot. No secret values are logged.
 
@@ -373,4 +399,5 @@ def load_config(turso: ConfigSource) -> Config:
         nas=load_nas_config(turso),
         nas_watchdog=load_nas_watchdog_config(turso),
         network=load_network_config(turso),
+        internal=load_internal_config(turso),
     )

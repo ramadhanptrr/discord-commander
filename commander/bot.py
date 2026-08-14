@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from commander.authorization import InteractionAuthorizer
-from commander.config import Config, load_config, load_turso_config
+from commander.config import Config, load_config, load_internal_config, load_turso_config
 from commander.edge import EdgeController
 from commander.logger import setup_logger
 from commander.mikrotik import MikroTikClient
@@ -279,6 +279,22 @@ class CommanderBot(commands.Bot):
         """Notify the watchdog channel once for each newly started Commander process."""
         async with self._startup_notification_lock:
             if self._startup_notification_sent:
+                return
+
+            try:
+                internal_config = load_internal_config(self._turso_cache)
+            except Exception:
+                logger.exception(
+                    "Could not read ENABLE_STARTUP_NOTIFICATION from Turso; "
+                    "defaulting to sending the Commander startup notification"
+                )
+                internal_config = None
+
+            if internal_config is not None and not internal_config.enable_startup_notification:
+                self._startup_notification_sent = True
+                logger.info(
+                    "Commander startup notification skipped (ENABLE_STARTUP_NOTIFICATION=FALSE)"
+                )
                 return
 
             try:

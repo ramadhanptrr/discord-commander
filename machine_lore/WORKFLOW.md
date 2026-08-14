@@ -466,6 +466,7 @@ recommendation to enforce there, not something this repository can migrate itsel
 | `NETWORK_PING_TIMEOUT` | Turso (`home_network`) | Optional; `3` | Positive seconds waited per ICMP probe. |
 | `NETWORK_ANCHOR_HOST` | Turso (`home_network`) | Optional; disabled when empty | Safe hostname/IP used as the VPS uplink control probe. |
 | `NETWORK_CONFIRM_DELAY` | Turso (`home_network`) | Optional; `15` | Non-negative seconds before a second outage check. `0` disables the delay/confirmation round. |
+| `ENABLE_STARTUP_NOTIFICATION` | Turso (`internal`) | Optional; `TRUE` | `TRUE`/`FALSE`. Whether Commander posts the "Commander online" message to the watchdog channel after each restart. |
 
 ## 10. Logging and failure handling
 
