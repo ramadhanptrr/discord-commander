@@ -98,7 +98,7 @@ compromised container from reading or using keys.
 | SEC-02 | Medium | Container mounts the entire VPS SSH directory | Open |
 | SEC-03 | Medium | Application container runs as root | Open |
 | ABUSE-01 | Low | Only confirmed power actions have rate limits | Open |
-| REL-01 | Low | Process-local state resets on restart | Accepted/documented |
+| REL-01 | Low | Process-local state resets on restart | Partially mitigated (network + NAS watchdogs); accepted/documented for the rest |
 | SUP-01 | Low | `infisicalsdk` dependency is not version-pinned | Open |
 | MON-01 | Low | Some tunnel/path failures remain indistinguishable from a home outage | Open |
 | CFG-01 | Informational | Application values refresh only on container restart | Accepted/documented |
@@ -149,13 +149,31 @@ operation layer so slash commands and panel buttons cannot diverge.
 
 ### REL-01: State is memory-only
 
-Rate-limit windows, power-lock state, active confirmation views, network outage timestamp, and NAS
-reminder timestamp disappear on restart. A restart during a network outage can generate one fresh
-DOWN alert with downtime measured from the restart; an overdue NAS can send a reminder again.
+Rate-limit windows, power-lock state, and active confirmation views still disappear on restart.
 
-Recommended action: accept this small-control-plane behaviour, or persist only the minimal watchdog
-state if duplicate restart alerts become operationally costly. Do not persist power locks without a
-recovery/lease design.
+The network watchdog's down flag/down-since timestamp and the NAS watchdog's last-reminder timestamp
+are no longer purely memory-only: both `NetworkWatchdog` and `NasUptimeWatchdog` now restore their
+state from Turso Cloud's `event_history` table and persist it there through a shared, dedicated
+`TursoProdWriter`, after the corresponding Discord notification has already succeeded
+(`commander/netmonitor.py`, `commander/nasmonitor.py`, `commander/turso/writer.py`). This closes the
+originally-described failure modes -- a duplicate DOWN alert with understated downtime after a
+restart during a real network outage; a completely silent missed outage if the network recovered
+during the restart window; a duplicate NAS reminder sent sooner than `NAS_MAX_AGE_REMINDER_MINUTE`
+actually allows -- but only on a best-effort basis. Persisting depends on Turso Cloud being reachable
+at that exact moment, which is a weaker guarantee than the in-memory Discord-notification path each
+sits behind. A failed persist is retried on later watchdog ticks rather than dropped, but if the
+container is rebuilt again before a retry succeeds, restore falls back to the last successfully
+persisted row -- i.e. this narrows the original gap rather than eliminating it. The NAS restore has
+an extra correctness requirement the network one does not: a restored reminder timestamp is only
+trusted if it is not older than the NAS's live boot epoch (otherwise the NAS rebooted since that
+reminder, and the timestamp is stale). See `machine_lore/ARCHITECTURE.md` §8,
+`migrations/network_watchdog_state_migration.md`, and
+`migrations/nas_uptime_watchdog_state_migration.md` for the full design, including the explicit
+decision to keep `TursoProdWriter` on its own connection and executor so a write-path failure can
+never affect `TursoCacheManager`'s configuration reads.
+
+Recommended action: accept the remaining memory-only state (rate limits, power lock, confirmation
+views) as small-control-plane behaviour. Do not persist power locks without a recovery/lease design.
 
 ### SUP-01: Infisical SDK dependency is unpinned
 
@@ -209,7 +227,7 @@ Recommended action: complete and retain the verification checklist below after m
 | SSH interception | Private/routed network path | Host key is not persistently verified |
 | Hang in remote command | Per-operation subprocess timeout | Failed/slow remote system still delays that operation |
 | Event-loop blocking | Worker threads for SSH/ICMP | Thread-pool exhaustion remains theoretically possible under abuse |
-| NAS left online | Uptime threshold and repeated reminders | Reminder state resets on restart |
+| NAS left online | Uptime threshold and repeated reminders | Reminder state best-effort persisted to Turso (REL-01); still resets if Turso Cloud is unreachable at persist time |
 | Home outage missed/noisy | Confirmed transition monitor and optional anchor | Tunnel-only fault classification is limited |
 | Discord watchdog message pings a broad audience | `AllowedMentions.none()` | Channel audience/roles are externally managed |
 | Image dependency drift | Python dependency manifest | Unpinned Infisical SDK can change at build time |

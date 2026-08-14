@@ -80,12 +80,13 @@ publishing it globally.
 | `NasController` | NAS reachability, wake delegation, shutdown, and boot-epoch lookup. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
 | `EdgeController` | Fixed edge information script over SSH. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
 | `NetworkChecker` | Runs Linux `ping` directly from the container. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
-| `NetworkWatchdog` | Tracks UP/DOWN network state and sends transition alerts. | Down flag and down-since time in memory; re-reads config each tick. |
-| `NasUptimeWatchdog` | Tracks NAS-on duration and sends reminders. | Last-alert timestamp in memory; re-reads config each tick. |
+| `NetworkWatchdog` | Tracks UP/DOWN network state and sends transition alerts. | Down flag and down-since time in memory, restored from Turso `event_history` at construction and persisted there on every transition (best-effort; see §8); re-reads config each tick. |
+| `NasUptimeWatchdog` | Tracks NAS-on duration and sends reminders. | Last-alert timestamp in memory, restored from Turso `event_history` (validated against the NAS's live boot epoch before being trusted; see §8) and persisted there on every reminder (best-effort); re-reads config each tick. |
 | `DiscordWatchdogNotifier` | Delivers automatic embeds to watchdog channel without mentions, including Turso DOWN/reminder/RECOVERED alerts. | Bot reference and channel ID. |
 | `RateLimiter` | Per-user window for confirmed wake/shutdown actions. | Timestamps in memory. |
 | `PowerOperationState` | Mutual exclusion for wake/shutdown. | Active-operation name in memory. |
-| `TursoCacheManager` | Owns the local libSQL replica lifecycle: fresh startup bootstrap (fail-closed), periodic sync from Turso Cloud, and DOWN/reminder/RECOVERED notification state. Local reads (`read_group`) never touch Turso Cloud. | Synced connection, dedicated single-thread executor, health/notification state in memory. |
+| `TursoCacheManager` | Owns the local libSQL replica lifecycle: fresh startup bootstrap (fail-closed), periodic sync from Turso Cloud, and DOWN/reminder/RECOVERED notification state. Local reads (`read_group`, `read_latest_event`) never touch Turso Cloud. | Synced connection, dedicated single-thread executor, health/notification state in memory. |
+| `TursoProdWriter` | Owns a second, separate embedded-replica connection used only to push application-generated rows (currently `event_history`) to Turso Cloud. Connects lazily on first write; never blocks or fails application startup. | Own synced connection and dedicated single-thread executor, independent of `TursoCacheManager`'s. |
 
 ## 4. Data and control flows
 
@@ -112,24 +113,33 @@ container ICMP -> MIKROTIK_HOST
   -> optional anchor ICMP control probe
   -> optional delayed confirmation round
   -> Discord watchdog-channel DOWN alert
+  -> in-memory state flips, then a best-effort event_history row is pushed via TursoProdWriter
   -> repeated recovery probes
   -> Discord watchdog-channel RECOVERED alert with downtime
+  -> in-memory state flips, then a best-effort event_history row is pushed via TursoProdWriter
 ```
 
 Only detected state transitions send notifications. The control room does not receive autonomous
-network alerts; manual status commands remain separate from alert state.
+network alerts; manual status commands remain separate from alert state. The Turso Cloud write
+always happens after the Discord notification, and a failed write is retried on later ticks rather
+than dropped -- see §8 and `migrations/network_watchdog_state_migration.md`.
 
 ### 4.3 NAS uptime watchdog flow
 
 ```text
 MikroTik SSH ping -> NAS online?
   -> NAS SSH uptime script -> Unix boot epoch
+  -> restored reminder timestamp validated against this boot epoch, applied or discarded once
   -> threshold/reminder calculation
   -> Discord watchdog-channel NAS still online reminder
+  -> a best-effort event_history row is pushed via TursoProdWriter
 ```
 
 During a wake or shutdown operation the uptime watchdog deliberately skips work, preventing normal
-power transitions from being framed as forgotten-online incidents.
+power transitions from being framed as forgotten-online incidents. Unlike the network watchdog's
+UP/DOWN restore, the NAS reminder timestamp is only valid for the NAS's *current* uptime streak, so
+restoring it can only be resolved once a live boot epoch is available -- see §8 and
+`migrations/nas_uptime_watchdog_state_migration.md`.
 
 ## 5. Trust boundaries
 
@@ -147,16 +157,18 @@ power transitions from being framed as forgotten-online incidents.
 ```text
 VPS files                            Infisical                    Turso Cloud
 ---------                            ---------                    -----------
-~/secrets/infisical/*       ->       Discord token/IDs             (nothing reads it directly;
-                                      MikroTik host/user            TursoCacheManager owns the
-                                      Turso URL/token/intervals     only connection)
+~/secrets/infisical/*       ->       Discord token/IDs             master_configurations (read by
+                                      MikroTik host/user            TursoCacheManager) and
+                                      Turso URL/token/intervals     event_history (written by
+                                                                     TursoProdWriter)
               |                             |                             |
-              +-- Docker secrets --> Commander at startup           bootstrap + periodic pull
-                                             |                             |
-                                             v                             v
-                                   immutable Config snapshot   /data/turso/local.db (edge, nas,
-                                   (Discord + MikroTik only,   home_network groups; read fresh
-                                   restart to change)          on every action, no restart)
+              +-- Docker secrets --> Commander at startup     bootstrap + periodic pull (read) /
+                                             |                 lazy connect + push on write (write)
+                                             v                             |
+                                   immutable Config snapshot               v
+                                   (Discord + MikroTik only,   /data/turso/local.db (read replica,
+                                   restart to change)          fresh every start) and an in-memory
+                                                                (":memory:") store for writes only
 ```
 
 The Compose environment contains only paths/defaults used to bootstrap Infisical, not application
@@ -169,6 +181,24 @@ there applies on the next action once periodic sync has pulled it in, with no re
 connection/sync settings themselves (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
 `TURSO_DB_SYNC_INTERVAL`, `TURSO_DB_DOWN_REMINDER`) stay on Infisical, read once at startup, since
 they must exist before the Turso replica does.
+
+`TursoProdWriter` is a separate, one-directional write path layered on top of the same Turso Cloud
+database, shared by both watchdogs that need it: `NetworkWatchdog` pushes an `event_history` row
+(`identifier="home_network"`, `current_state` = `"UP"`/`"DOWN"`) on every transition, and
+`NasUptimeWatchdog` pushes one (`identifier="nas"`, `current_state="REMINDER_SENT"`) every time it
+sends a reminder -- both only after the corresponding Discord notification has already succeeded.
+One writer instance is reused for both identifiers/tables rather than one writer per watchdog. It
+uses its own `":memory:"`-backed connection and dedicated executor, independent of
+`TursoCacheManager`'s -- `TursoCacheManager` never writes, and `TursoProdWriter` never reads
+application configuration. `":memory:"` rather than a file is deliberate: `pyturso`'s sync API has no
+remote-only mode (a local store is always required, even for a write-only connection that never
+reads it back), but this writer never needs that local store to outlive a single write, so it needs
+no Docker volume, directory, or path configuration at all. See §8 and
+[`network_watchdog_state_migration.md`](../migrations/network_watchdog_state_migration.md) /
+[`nas_uptime_watchdog_state_migration.md`](../migrations/nas_uptime_watchdog_state_migration.md) for
+the full write/restore design and its failure semantics -- the two watchdogs' restore logic differs
+in an important way (the NAS one needs a live boot-epoch check, the network one does not) that is
+only documented there, not repeated here.
 
 The detailed secret catalog, defaults, and validation rules are in
 [WORKFLOW.md](./WORKFLOW.md#9-configuration-reference); the full Turso bootstrap/sync/notification
@@ -186,9 +216,11 @@ The Docker image is based on `python:3.11-slim` and installs:
 
 The container runs `python -m commander.bot`, has `restart: unless-stopped`, publishes no ports,
 mounts the VPS `~/.ssh` directory read-only at `/root/.ssh`, and mounts a dedicated
-`commander_turso_data` volume at `/data/turso` for the local Turso replica (intentionally deleted
-and rebuilt from Turso Cloud on every container start; see
-[WORKFLOW.md §7.3](./WORKFLOW.md#73-turso-synchronization-watchdog)). The broad SSH mount and
+`commander_turso_data` volume at `/data/turso` for `TursoCacheManager`'s `local.db` read replica
+(intentionally deleted and rebuilt from Turso Cloud on every container start; see
+[WORKFLOW.md §7.3](./WORKFLOW.md#73-turso-synchronization-watchdog)). `TursoProdWriter` needs no
+volume of its own -- it connects with `":memory:"` as its local store (§6), since `pyturso` requires
+one for every connection but this write-only path never reads it back. The broad SSH mount and
 current host key policy are deliberate topics in [AUDIT.md](./AUDIT.md), not endorsements of that
 long-term deployment shape.
 
@@ -199,15 +231,34 @@ process and is lost on restart:
 
 - wake/shutdown lock state;
 - per-user power rate-limit history;
-- active 60-second confirmation views;
-- network watchdog down flag and downtime start time;
-- NAS watchdog last-reminder timestamp.
+- active 60-second confirmation views.
 
 The persistent panel itself is recoverable after restart because its component IDs are registered in
-`setup_hook()`. The NAS watchdog can reconstruct actual NAS uptime from the boot epoch returned by
-the NAS, but it cannot preserve the exact last reminder time; an overdue NAS may therefore alert
-again after a restart. The network watchdog has no external outage timestamp and reports a new
-outage from the restarted process if the network is still unreachable.
+`setup_hook()`.
+
+The network watchdog's down flag/down-since time and the NAS watchdog's last-reminder timestamp are
+both now restored from Turso Cloud's `event_history` table rather than being purely memory-only, via
+the same `TursoCacheManager.read_latest_event`-to-restore / `TursoProdWriter.record_event`-to-persist
+shape, always *after* the corresponding Discord notification has already succeeded. Both are
+best-effort mirrors, not a hard guarantee: persisting depends on Turso Cloud being reachable at that
+moment, which is a strictly weaker guarantee than the in-memory Discord-notification path each sits
+behind. A failed persist is retried on later watchdog ticks (`_pending_persist` on both classes)
+rather than dropped, but if the container is rebuilt again before a retry succeeds, restore falls
+back to whatever the last successfully persisted row says.
+
+The two restores are not symmetric, though:
+
+- `NetworkWatchdog` restores fully at construction time, purely from the local Turso replica -- an
+  UP/DOWN transition is self-contained and needs no other live signal to be trusted on restore.
+- `NasUptimeWatchdog` restores the raw timestamp at construction, but only *applies* it once the
+  first tick fetches a live boot epoch from the NAS, because a reminder timestamp is only valid for
+  the NAS's current uptime streak: if the NAS itself rebooted since that reminder was sent, the
+  restored value is stale and must be discarded rather than wrongly suppressing a reminder that is
+  actually due again (`restored_alert_at >= boot_epoch`).
+
+See [`network_watchdog_state_migration.md`](../migrations/network_watchdog_state_migration.md) and
+[`nas_uptime_watchdog_state_migration.md`](../migrations/nas_uptime_watchdog_state_migration.md) for
+the full designs and their explicit scenarios.
 
 ## 9. Ownership map
 
@@ -218,6 +269,7 @@ outage from the restarted process if the network is still unreachable.
 | Container build/runtime declaration | `Dockerfile`, `docker-compose.yml` |
 | Discord identity, MikroTik identity, Turso connection/sync settings | Infisical |
 | Edge, NAS, and home-network operational values (`master_configurations`) | Turso Cloud |
+| Network/NAS watchdog operational history (`event_history`) | Turso Cloud (written by `TursoProdWriter`) |
 | Universal Auth bootstrap files | VPS `~/secrets/infisical/` |
 | Discord guild/channel roles and bot install | Discord administration |
 | VPS firewall, Docker daemon, host SSH, mounted identities | VPS administration |

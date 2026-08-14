@@ -22,6 +22,7 @@ from commander.operations import OperatorOperations
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
 from commander.turso.cache_manager import TursoCacheManager
+from commander.turso.writer import TursoProdWriter
 from commander.ui.panel import CommanderPanel, build_panel_embed
 
 
@@ -94,7 +95,9 @@ class ShutdownCommandGroup(app_commands.Group):
 class CommanderBot(commands.Bot):
     """Discord transport for the first Commander migration phase."""
 
-    def __init__(self, config: Config, turso_cache: TursoCacheManager) -> None:
+    def __init__(
+        self, config: Config, turso_cache: TursoCacheManager, turso_writer: TursoProdWriter
+    ) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
@@ -112,6 +115,7 @@ class CommanderBot(commands.Bot):
         self._watchdog_notifier = watchdog_notifier
         self._turso_cache = turso_cache
         self._turso_cache.attach_notifier(watchdog_notifier)
+        self._turso_writer = turso_writer
         self._turso_sync_task: asyncio.Task[None] | None = None
         nas = NasController(turso_cache, mikrotik)
         self._operations = OperatorOperations(
@@ -126,12 +130,14 @@ class CommanderBot(commands.Bot):
             network_checker,
             turso_cache,
             watchdog_notifier,
+            turso_writer,
         )
         self._nas_uptime_watchdog = NasUptimeWatchdog(
             nas,
             turso_cache,
             power_state,
             watchdog_notifier,
+            turso_writer,
         )
         self._operations.set_network_watchdog(self._network_watchdog)
         self._network_watchdog_task: asyncio.Task[None] | None = None
@@ -304,6 +310,7 @@ class CommanderBot(commands.Bot):
                 logger.exception("Watchdog task ended with an unexpected error during shutdown")
         logger.info("Stopping Turso database synchronization task.")
         await self._turso_cache.aclose()
+        await self._turso_writer.aclose()
         await super().close()
 
     async def on_app_command_error(
@@ -326,6 +333,10 @@ def main() -> None:
     # Fresh replica on every process start (see machine_lore/ARCHITECTURE.md); this must finish
     # before load_config() below, which reads edge/NAS/home-network values out of the replica.
     asyncio.run(turso_cache.bootstrap())
+    # No bootstrap step here by design: TursoProdWriter connects lazily on its first write so a
+    # Turso Cloud hiccup at boot time never fails Commander startup (see
+    # migrations/network_watchdog_state_migration.md §5).
+    turso_writer = TursoProdWriter(turso_config)
 
     config = load_config(turso_cache)
     logger.info(
@@ -334,7 +345,7 @@ def main() -> None:
         config.discord.control_room_channel_id,
         config.discord.watchdog_channel_id,
     )
-    CommanderBot(config, turso_cache).run(config.discord.bot_token, log_handler=None)
+    CommanderBot(config, turso_cache, turso_writer).run(config.discord.bot_token, log_handler=None)
 
 
 if __name__ == "__main__":

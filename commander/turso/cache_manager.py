@@ -13,6 +13,7 @@ import turso.sync
 
 from commander.config import TursoConfig
 from commander.turso.queries.config_queries import SELECT_GROUP_BY_IDENTIFIER
+from commander.turso.queries.event_queries import SELECT_LATEST_EVENT_BY_IDENTIFIER
 
 
 logger = logging.getLogger("commander.turso")
@@ -290,6 +291,33 @@ class TursoCacheManager:
                 sorted(group.keys()),
             )
         return group
+
+    def read_latest_event(self, identifier: str) -> dict[str, str] | None:
+        """Return the most recent ``event_history`` row for ``identifier``, or ``None``.
+
+        Local-only, same guarantees as ``read_group()`` (opens its own short-lived local
+        connection). ``TursoProdWriter`` pushes ``event_history`` rows straight to Turso Cloud; this
+        reads them back out of the same periodically synced local replica ``read_group()`` uses, so
+        a row written before a restart is already present by the time ``bootstrap()`` finishes the
+        next fresh pull -- no direct connection to ``TursoProdWriter`` or Turso Cloud is needed here.
+        """
+        if not self._bootstrapped:
+            raise RuntimeError("Turso local database is not ready; bootstrap() must run first")
+
+        connection = turso.connect(str(self._local_db_path))
+        try:
+            rows = connection.execute(SELECT_LATEST_EVENT_BY_IDENTIFIER, (identifier,)).fetchall()
+        finally:
+            connection.close()
+
+        if not rows:
+            return None
+
+        raw_state, raw_created_at = rows[0][0], rows[0][1]
+        return {
+            "current_state": "" if raw_state is None else str(raw_state).strip(),
+            "created_at": "" if raw_created_at is None else str(raw_created_at).strip(),
+        }
 
     # -- periodic synchronization ---------------------------------------------------------
 

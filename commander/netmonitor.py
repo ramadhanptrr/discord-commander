@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Protocol
+from typing import Literal, Protocol
 
 from commander.config import ConfigSource, NetworkConfig, load_network_config
 from commander.network import NetworkChecker
+from commander.turso.event_state import EventHistorySource, parse_event_timestamp
+from commander.turso.writer import EventWriter
 
 
 logger = logging.getLogger("commander.netmonitor")
@@ -15,11 +17,22 @@ logger = logging.getLogger("commander.netmonitor")
 # backs off sensibly instead of retrying in a tight loop.
 _CONFIG_ERROR_RETRY_SECONDS = 60
 
+# Matches the "home_network" identifier already used for this group in master_configurations
+# (commander/config.py), so operational history and configuration for the same subsystem share one
+# name. See migrations/network_watchdog_state_migration.md.
+_EVENT_IDENTIFIER = "home_network"
+
+_TransitionState = Literal["UP", "DOWN"]
+
 
 class NetworkAlertNotifier(Protocol):
     async def send_network_down(self, host: str, checks: list[str]) -> None: ...
 
     async def send_network_recovered(self, host: str, downtime: float | None) -> None: ...
+
+
+class NetworkStateSource(ConfigSource, EventHistorySource, Protocol):
+    """Everything ``NetworkWatchdog`` needs from Turso: config reads plus state restore."""
 
 
 def format_duration(seconds: float) -> str:
@@ -41,14 +54,21 @@ class NetworkWatchdog:
     def __init__(
         self,
         checker: NetworkChecker,
-        turso: ConfigSource,
+        turso: NetworkStateSource,
         notifier: NetworkAlertNotifier,
+        writer: EventWriter,
     ) -> None:
         self._checker = checker
         self._turso = turso
         self._notifier = notifier
+        self._writer = writer
         self._is_down = False
         self._down_since: float | None = None
+        # A transition that failed to persist to Turso Cloud; retried at the top of every
+        # subsequent tick until record_event() succeeds. See
+        # migrations/network_watchdog_state_migration.md §6.
+        self._pending_persist: _TransitionState | None = None
+        self._restore_state()
 
     @property
     def is_down(self) -> bool:
@@ -58,11 +78,57 @@ class NetworkWatchdog:
     def down_since(self) -> float | None:
         return self._down_since
 
+    def _restore_state(self) -> None:
+        """Best-effort restore from the last persisted transition. Never raises.
+
+        Runs synchronously in __init__ (turso.read_latest_event() is a local-only read, and
+        bootstrap() has already completed by the time NetworkWatchdog is constructed in bot.py), so
+        a container rebuild during a real outage resumes in the DOWN state instead of re-detecting
+        it as a fresh outage. See migrations/network_watchdog_state_migration.md §7.
+        """
+        try:
+            event = self._turso.read_latest_event(_EVENT_IDENTIFIER)
+        except Exception:
+            logger.exception(
+                "Failed to restore network watchdog state from Turso; defaulting to UP"
+            )
+            return
+
+        if event is None or event.get("current_state") != "DOWN":
+            return
+
+        down_since = parse_event_timestamp(event.get("created_at", ""))
+        if down_since is None:
+            logger.warning(
+                "Restored a DOWN event_history row with an unparsable created_at value; "
+                "defaulting to UP"
+            )
+            return
+
+        self._is_down = True
+        self._down_since = down_since
+        logger.info(
+            "Restored network watchdog state: DOWN since %s",
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(down_since)),
+        )
+
+    async def _flush_pending_persist(self) -> None:
+        if self._pending_persist is not None:
+            await self._persist(self._pending_persist)
+
+    async def _persist(self, state: _TransitionState) -> None:
+        """Best-effort persist of the current state to Turso Cloud; retried on later ticks."""
+        if await self._writer.record_event(_EVENT_IDENTIFIER, state):
+            self._pending_persist = None
+        else:
+            self._pending_persist = state
+
     async def run(self) -> None:
         logger.info("Network watchdog started")
         while True:
             sleep_seconds = _CONFIG_ERROR_RETRY_SECONDS
             try:
+                await self._flush_pending_persist()
                 config = load_network_config(self._turso)
                 if self._is_down:
                     await self._check_recovery(config)
@@ -109,6 +175,7 @@ class NetworkWatchdog:
         await self._notifier.send_network_down(config.host, checks)
         self._is_down = True
         self._down_since = detected_at
+        await self._persist("DOWN")
 
     async def _check_recovery(self, config: NetworkConfig) -> None:
         if not await self._ping(config.host, config.watchdog_recovery_probe_count):
@@ -119,6 +186,7 @@ class NetworkWatchdog:
         await self._notifier.send_network_recovered(config.host, downtime)
         self._is_down = False
         self._down_since = None
+        await self._persist("UP")
 
     async def _anchor_healthy(self, config: NetworkConfig) -> bool:
         if not config.anchor_host:
