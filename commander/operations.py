@@ -4,17 +4,18 @@ import asyncio
 import io
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import discord
 
-from commander.config import ConfigSource, load_network_config
 from commander.edge import EdgeController
-from commander.nas import NasController
-from commander.netmonitor import NetworkWatchdog, format_duration
-from commander.network import NetworkChecker
 from commander.power_state import PowerOperationState
 from commander.ratelimit import RateLimiter
+from shared.config import ConfigSource, load_network_config
+from shared.duration import format_duration
+from shared.nas import NasController
+from shared.network import HOME_NETWORK_EVENT_IDENTIFIER, NetworkChecker
+from shared.turso.event_state import EventHistorySource, parse_event_timestamp
 
 if TYPE_CHECKING:
     from commander.authorization import InteractionAuthorizer
@@ -43,12 +44,17 @@ def _code_block(value: str) -> str:
     return f"```text\n{escaped_value}\n```"
 
 
+class NetworkStatusSource(ConfigSource, EventHistorySource, Protocol):
+    """Everything the manual ``/status net`` display needs from Turso: config plus watchdog state
+    Worker Pooling persisted to ``event_history`` and synced into the shared local replica."""
+
+
 class OperatorOperations:
     """Shared public control-room operations for both commands and panel buttons."""
 
     def __init__(
         self,
-        turso: ConfigSource,
+        turso: NetworkStatusSource,
         edge: EdgeController,
         network: NetworkChecker,
         nas: NasController,
@@ -61,10 +67,6 @@ class OperatorOperations:
         self._nas = nas
         self._power_state = power_state
         self._limiter = limiter
-        self._network_watchdog: NetworkWatchdog | None = None
-
-    def set_network_watchdog(self, watchdog: NetworkWatchdog) -> None:
-        self._network_watchdog = watchdog
 
     async def ping(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message("🏓 Pong!", ephemeral=False)
@@ -147,12 +149,10 @@ class OperatorOperations:
                     colour=discord.Colour.red(),
                 )
 
-        if self._network_watchdog and self._network_watchdog.is_down:
-            downtime = (
-                format_duration(time.time() - self._network_watchdog.down_since)
-                if self._network_watchdog.down_since is not None
-                else "unknown"
-            )
+        watchdog_event = self._read_home_network_watchdog_event()
+        if watchdog_event is not None and watchdog_event.get("current_state") == "DOWN":
+            down_since = parse_event_timestamp(watchdog_event.get("created_at", ""))
+            downtime = format_duration(time.time() - down_since) if down_since is not None else "unknown"
             embed.add_field(
                 name="Watchdog state",
                 value=f"DOWN for {downtime}.",
@@ -161,6 +161,18 @@ class OperatorOperations:
 
         embed.set_footer(text="Manual check • Commander control room")
         await interaction.edit_original_response(content=None, embed=embed)
+
+    def _read_home_network_watchdog_event(self) -> dict[str, str] | None:
+        """Best-effort local read of Worker Pooling's latest network watchdog transition.
+
+        Never raises: a failed read just means the "Watchdog state" field is omitted, matching how
+        every other best-effort Turso read in this codebase degrades.
+        """
+        try:
+            return self._turso.read_latest_event(HOME_NETWORK_EVENT_IDENTIFIER)
+        except Exception:
+            logger.exception("Failed to read network watchdog state from Turso")
+            return None
 
     async def request_wake(
         self, interaction: discord.Interaction, authorizer: InteractionAuthorizer

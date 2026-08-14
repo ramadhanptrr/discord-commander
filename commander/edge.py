@@ -4,7 +4,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 
-from commander.config import ConfigSource, load_edge_config
+from shared.config import ConfigSource, load_edge_config
 
 
 logger = logging.getLogger("commander.edge")

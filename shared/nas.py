@@ -4,11 +4,11 @@ import logging
 import subprocess
 from dataclasses import dataclass
 
-from commander.config import ConfigSource, load_nas_config
-from commander.mikrotik import MikroTikClient
+from shared.config import ConfigSource, load_nas_config
+from shared.mikrotik import MikroTikClient
 
 
-logger = logging.getLogger("commander.nas")
+logger = logging.getLogger("shared.nas")
 
 
 @dataclass(frozen=True)

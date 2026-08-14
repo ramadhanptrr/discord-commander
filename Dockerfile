@@ -11,6 +11,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY commander/ ./commander/
+COPY worker/ ./worker/
+COPY shared/ ./shared/
 
 ENV PYTHONUNBUFFERED=1
 

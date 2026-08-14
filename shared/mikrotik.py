@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from commander.config import ConfigSource, load_mikrotik_config
+from shared.config import ConfigSource, load_mikrotik_config
 
 
-logger = logging.getLogger("commander.mikrotik")
+logger = logging.getLogger("shared.mikrotik")
 
 
 class MikroTikClient:

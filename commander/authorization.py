@@ -4,7 +4,7 @@ import logging
 
 import discord
 
-from commander.config import DiscordConfig
+from shared.config import DiscordConfig
 
 
 logger = logging.getLogger("commander.authorization")

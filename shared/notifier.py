@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import discord
 
-from commander.netmonitor import format_duration
+from shared.duration import format_duration
 
 
 def _format_timestamp(epoch_seconds: float | None) -> str:

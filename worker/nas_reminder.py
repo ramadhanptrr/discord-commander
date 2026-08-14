@@ -5,22 +5,21 @@ import logging
 import time
 from typing import Protocol
 
-from commander.config import ConfigSource, NasWatchdogConfig, load_nas_watchdog_config
-from commander.nas import NasController
-from commander.netmonitor import format_duration
-from commander.power_state import PowerOperationState
-from commander.turso.event_state import EventHistorySource, parse_event_timestamp
-from commander.turso.writer import EventWriter
+from shared.config import ConfigSource, NasWatchdogConfig, load_nas_watchdog_config
+from shared.duration import format_duration
+from shared.nas import NasController
+from shared.turso.event_state import EventHistorySource, parse_event_timestamp
+from shared.turso.writer import EventWriter
 
 
-logger = logging.getLogger("commander.nasmonitor")
+logger = logging.getLogger("worker.nas_reminder")
 
 # Sleep used after a tick that failed to even load a valid config, so a broken Turso value
 # backs off sensibly instead of retrying in a tight loop.
 _CONFIG_ERROR_RETRY_SECONDS = 60
 
 # Matches the "nas" identifier already used for this group in master_configurations
-# (commander/config.py). See migrations/nas_uptime_watchdog_state_migration.md.
+# (shared/config.py). See migrations/nas_uptime_watchdog_state_migration.md.
 _EVENT_IDENTIFIER = "nas"
 _REMINDER_SENT = "REMINDER_SENT"
 
@@ -44,13 +43,11 @@ class NasUptimeWatchdog:
         self,
         nas: NasController,
         turso: NasStateSource,
-        power_state: PowerOperationState,
         notifier: NasUptimeNotifier,
         writer: EventWriter,
     ) -> None:
         self._nas = nas
         self._turso = turso
-        self._power_state = power_state
         self._notifier = notifier
         self._writer = writer
         self._last_alert_at: float | None = None
@@ -128,10 +125,10 @@ class NasUptimeWatchdog:
             await asyncio.sleep(sleep_seconds)
 
     async def _tick(self, config: NasWatchdogConfig) -> None:
-        # A wake or shutdown is a temporary transition, not a forgotten-online state.
-        if self._power_state.active_operation is not None:
-            return
-
+        # No explicit Wake/Shutdown coordination needed here (they run in a different process):
+        # is_online() is False for the whole boot window, and once online, uptime starts near 0s
+        # -- both keep this naturally gated below without needing to know a power operation is
+        # in progress. See migrations/worker_split_shared_cache.md.
         if not await asyncio.to_thread(self._nas.is_online):
             self._last_alert_at = None
             return

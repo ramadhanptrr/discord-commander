@@ -7,11 +7,11 @@ from typing import Protocol
 
 import turso.sync
 
-from commander.config import TursoConfig
-from commander.turso.queries.event_queries import INSERT_EVENT_HISTORY
+from shared.config import TursoConfig
+from shared.turso.queries.event_queries import INSERT_EVENT_HISTORY
 
 
-logger = logging.getLogger("commander.turso.writer")
+logger = logging.getLogger("shared.turso.writer")
 
 
 class EventWriter(Protocol):
@@ -19,7 +19,7 @@ class EventWriter(Protocol):
 
     Kept here (next to the concrete implementation) rather than in each watchdog module, since
     every consumer needs the exact same one-method shape -- see
-    ``commander/turso/event_state.py`` for the matching read-side ``EventHistorySource``.
+    ``shared/turso/event_state.py`` for the matching read-side ``EventHistorySource``.
     """
 
     async def record_event(self, identifier: str, current_state: str) -> bool: ...

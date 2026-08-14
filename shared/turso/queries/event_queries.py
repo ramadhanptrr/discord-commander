@@ -1,8 +1,8 @@
-"""SQL for Commander's ``event_history`` table (watchdog transition persistence).
+"""SQL for the ``event_history`` table (watchdog transition persistence).
 
 Unlike ``config_queries.py`` (local-only reads against the periodically synced config replica),
 ``INSERT_EVENT_HISTORY`` runs against ``TursoProdWriter``'s own embedded-replica connection and is
-pushed straight to Turso Cloud after every write (see ``commander/turso/writer.py``).
+pushed straight to Turso Cloud after every write (see ``shared/turso/writer.py``).
 ``SELECT_LATEST_EVENT_BY_IDENTIFIER`` is a local-only read, intended to run against
 ``TursoCacheManager``'s periodically synced replica the same way ``config_queries.py`` reads do.
 """

@@ -1,11 +1,11 @@
 """Shared contracts/helpers for watchdogs that restore and persist state through ``event_history``.
 
-Used by both ``commander.netmonitor.NetworkWatchdog`` and ``commander.nasmonitor.NasUptimeWatchdog``
+Used by both ``worker.network_watchdog.NetworkWatchdog`` and ``worker.nas_reminder.NasUptimeWatchdog``
 -- see ``migrations/network_watchdog_state_migration.md`` and
 ``migrations/nas_uptime_watchdog_state_migration.md``. Kept separate from
-``commander/turso/cache_manager.py`` and ``commander/turso/writer.py`` (the concrete
-implementations) so a third watchdog adopting this pattern only needs this module plus its own
-``identifier``/value vocabulary, not a new Protocol shape.
+``shared/turso/cache_manager.py`` and ``shared/turso/writer.py`` (the concrete implementations) so
+a third watchdog adopting this pattern only needs this module plus its own ``identifier``/value
+vocabulary, not a new Protocol shape.
 """
 
 from __future__ import annotations

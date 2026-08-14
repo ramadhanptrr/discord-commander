@@ -3,10 +3,16 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from commander.config import ConfigSource, load_network_config
+from shared.config import ConfigSource, load_network_config
 
 
-logger = logging.getLogger("commander.network")
+logger = logging.getLogger("shared.network")
+
+# Matches the "home_network" identifier already used for this group in master_configurations
+# (shared/config.py), so operational history and configuration for the same subsystem share one
+# name. Shared here (rather than kept private inside worker/network_watchdog.py) because both the
+# Worker's watchdog and Commander's manual /status net display read event_history by this key.
+HOME_NETWORK_EVENT_IDENTIFIER = "home_network"
 
 
 class NetworkChecker:
