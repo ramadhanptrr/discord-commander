@@ -323,7 +323,7 @@ class CommanderBot(commands.Bot):
 def main() -> None:
     turso_config = load_turso_config()
     turso_cache = TursoCacheManager(turso_config, TURSO_LOCAL_DB_PATH)
-    # Fresh replica on every process start (migrations/turso_migrations.md §7); this must finish
+    # Fresh replica on every process start (see machine_lore/ARCHITECTURE.md); this must finish
     # before load_config() below, which reads edge/NAS/home-network values out of the replica.
     asyncio.run(turso_cache.bootstrap())
 

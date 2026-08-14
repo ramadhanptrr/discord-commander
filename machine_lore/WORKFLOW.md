@@ -61,7 +61,11 @@ tick: logged and retried after a 60-second backoff) rather than crashing the pro
 `commander.bot.main()` bootstraps the Turso local replica, then loads immutable configuration,
 before attempting a Discord connection. Missing/invalid Infisical values, a failed or timed-out
 Turso bootstrap, and invalid Turso-sourced values all stop startup without logging secret values
-(bootstrap timeout: 5 seconds).
+(hardcoded bootstrap timeout: `BOOTSTRAP_TIMEOUT_SECONDS = 30` in
+`commander/turso/cache_manager.py`). The connect/pull call has no cooperative cancellation hook, so
+the 30-second bound only stops *waiting* for it; the dedicated worker thread keeps running until
+pyturso's call actually returns, and a late-arriving connection is closed and discarded rather than
+adopted (see the docstring on `TursoCacheManager.bootstrap()`).
 
 `CommanderBot` then creates the following process-local components:
 
@@ -326,22 +330,30 @@ itself (`commander/turso/cache_manager.py`), separate from the network and NAS w
 every TURSO_DB_SYNC_INTERVAL minutes
   -> pull the local replica from Turso Cloud
        -> success while UP: remain silent, log only
-       -> success while DOWN: refresh local replica; send RECOVERED alert; state UP
-       -> failure while UP: send DOWN alert; record down_since; state DOWN
-       -> failure while DOWN: send a reminder only if TURSO_DB_DOWN_REMINDER minutes have
-          elapsed since the last DOWN/reminder alert; otherwise stay silent
+       -> success while DOWN: refresh local replica; state UP; RECOVERED alert pending
+       -> failure while UP: state DOWN; record down_since; DOWN alert pending
+       -> failure while DOWN, no alert pending: mark a reminder pending only if
+          TURSO_DB_DOWN_REMINDER minutes have elapsed since the last *delivered*
+          DOWN/reminder alert; otherwise stay silent
+       -> any tick with a DOWN/reminder/RECOVERED alert pending: attempt delivery
 ```
 
-A sync failure never stops Commander and never deletes the local replica: `read_group()` calls made
-by an in-flight action keep returning whatever the local replica file currently holds (see §1). The
-sync task exists to (a) keep the on-disk replica fresh so every subsequent `load_edge_config()` /
-`load_nas_config()` / `load_network_config()` call (and the *next* container restart's fresh
-bootstrap) sees current data, and (b) alert operators when Turso Cloud itself is unreachable. Since
+Turso health (UP/DOWN) and notification-delivery state are tracked separately
+(`commander/turso/cache_manager.py`): health always reflects the actual sync result on this tick,
+but a DOWN, reminder, or RECOVERED alert only clears its "pending" flag once the Discord send
+actually succeeds. A failed send is logged and retried on the *next* sync tick with the same
+message (an unsent initial DOWN alert is retried as DOWN, not silently escalated to a reminder);
+health itself is never faked to make a notification retry happen, and a pending RECOVERED alert
+survives a failed send without reverting the already-correct UP state. A sync failure never stops
+Commander and never deletes the local replica: `read_group()` calls made by an in-flight action
+keep returning whatever the local replica file currently holds (see §1). The sync task exists to
+(a) keep the on-disk replica fresh so every subsequent `load_edge_config()` / `load_nas_config()` /
+`load_network_config()` call (and the *next* container restart's fresh bootstrap) sees current
+data, and (b) alert operators when Turso Cloud itself is unreachable. Since
 `EdgeConfig`/`NasConfig`/`NetworkConfig` values are read fresh on every action rather than held in
 `Config` after startup, a Turso Cloud edit applies as soon as the periodic sync has pulled it in --
 no restart required. Discord identity and MikroTik host/port/username (Infisical) are the exception:
-those are still read once into `Config` at startup and do require a restart (`AUDIT.md` CFG-01
-describes the pre-Turso version of this restart requirement).
+those are still read once into `Config` at startup and do require a restart (`AUDIT.md` CFG-01).
 
 ## 8. SSH execution and output rules
 
@@ -409,6 +421,19 @@ network, not itself managed through Turso) and is read once at startup. Edge, NA
 home-network values come from the Turso replica and are read fresh on every action via
 `TursoCacheManager.read_group(identifier)` against the `master_configurations` table, grouped by
 the `identifier` column shown below -- no restart needed for these to take effect once synced.
+
+The `master_configurations` schema is owned in Turso Cloud, not by a migration in this repository
+(there is no `.sql`/schema-migration file here). `read_group()` rejects a duplicate normalized
+`(identifier, attribute_key)` pair as an application-level configuration error rather than silently
+picking one row, but that only catches the problem at read time. The schema itself should carry a
+matching database constraint so a duplicate is rejected at write time:
+
+```sql
+UNIQUE(identifier, attribute_key)
+```
+
+Apply this manually in Turso Cloud/Studio on `master_configurations` when convenient; it is a
+recommendation to enforce there, not something this repository can migrate itself.
 
 | Value | Source | Required/default | Consumer |
 |---|---|---|---|

@@ -258,9 +258,9 @@ class Config:
 def load_turso_config() -> TursoConfig:
     """Read Turso connection/sync bootstrap values from Infisical.
 
-    These four values must be available before the Turso local replica exists, so (per
-    migrations/turso_migrations.md §3) they stay on the existing Infisical bootstrap path rather
-    than living inside the Turso-backed data they are used to fetch.
+    These four values must be available before the Turso local replica exists, so they stay on the
+    existing Infisical bootstrap path rather than living inside the Turso-backed data they are used
+    to fetch (see machine_lore/ARCHITECTURE.md and WORKFLOW.md §9.2a).
     """
     v = _infisical_values()
     return TursoConfig(

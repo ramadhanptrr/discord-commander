@@ -76,15 +76,16 @@ publishing it globally.
 | `CommanderPanel` | Persistent panel buttons with stable component IDs. | No application state; restored on startup. |
 | `PowerConfirmationView` | 60-second, requester-bound confirmation controls. | Ephemeral in-memory view/message reference. |
 | `OperatorOperations` | Shared command/button responses and power workflows. | References controllers, limiter, power lock, network watchdog. |
-| `MikroTikClient` | Fixed RouterOS ping and WoL SSH commands. | Immutable config. |
-| `NasController` | NAS reachability, wake delegation, shutdown, and boot-epoch lookup. | Immutable config. |
-| `EdgeController` | Fixed edge information script over SSH. | Immutable config. |
-| `NetworkChecker` | Runs Linux `ping` directly from the container. | Immutable config. |
-| `NetworkWatchdog` | Tracks UP/DOWN network state and sends transition alerts. | Down flag and down-since time in memory. |
-| `NasUptimeWatchdog` | Tracks NAS-on duration and sends reminders. | Last-alert timestamp in memory. |
-| `DiscordWatchdogNotifier` | Delivers automatic embeds to watchdog channel without mentions. | Bot reference and channel ID. |
+| `MikroTikClient` | Fixed RouterOS ping and WoL SSH commands. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
+| `NasController` | NAS reachability, wake delegation, shutdown, and boot-epoch lookup. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
+| `EdgeController` | Fixed edge information script over SSH. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
+| `NetworkChecker` | Runs Linux `ping` directly from the container. | Holds `TursoCacheManager`; re-reads config fresh on every call. |
+| `NetworkWatchdog` | Tracks UP/DOWN network state and sends transition alerts. | Down flag and down-since time in memory; re-reads config each tick. |
+| `NasUptimeWatchdog` | Tracks NAS-on duration and sends reminders. | Last-alert timestamp in memory; re-reads config each tick. |
+| `DiscordWatchdogNotifier` | Delivers automatic embeds to watchdog channel without mentions, including Turso DOWN/reminder/RECOVERED alerts. | Bot reference and channel ID. |
 | `RateLimiter` | Per-user window for confirmed wake/shutdown actions. | Timestamps in memory. |
 | `PowerOperationState` | Mutual exclusion for wake/shutdown. | Active-operation name in memory. |
+| `TursoCacheManager` | Owns the local libSQL replica lifecycle: fresh startup bootstrap (fail-closed), periodic sync from Turso Cloud, and DOWN/reminder/RECOVERED notification state. Local reads (`read_group`) never touch Turso Cloud. | Synced connection, dedicated single-thread executor, health/notification state in memory. |
 
 ## 4. Data and control flows
 
@@ -144,21 +145,35 @@ power transitions from being framed as forgotten-online incidents.
 ## 6. Configuration and secret ownership
 
 ```text
-VPS files                                              Infisical
----------                                              ---------
-~/secrets/infisical/INFISICAL_CLIENT_ID       ->       Discord token and IDs
-~/secrets/infisical/INFISICAL_CLIENT_SECRET   ->       SSH/device settings
-~/secrets/infisical/INFISICAL_PROJECT_ID      ->       scripts and watchdog timings
-              |                                               |
-              +-- Docker secrets --> Commander at startup <---+
+VPS files                            Infisical                    Turso Cloud
+---------                            ---------                    -----------
+~/secrets/infisical/*       ->       Discord token/IDs             (nothing reads it directly;
+                                      MikroTik host/user            TursoCacheManager owns the
+                                      Turso URL/token/intervals     only connection)
+              |                             |                             |
+              +-- Docker secrets --> Commander at startup           bootstrap + periodic pull
+                                             |                             |
+                                             v                             v
+                                   immutable Config snapshot   /data/turso/local.db (edge, nas,
+                                   (Discord + MikroTik only,   home_network groups; read fresh
+                                   restart to change)          on every action, no restart)
 ```
 
 The Compose environment contains only paths/defaults used to bootstrap Infisical, not application
-secrets. `load_config()` materializes the full configuration once at startup. Even though the
-Infisical SDK wrapper has a small process cache, controllers do not refresh config dynamically.
+secrets. `load_config()` materializes Discord identity and MikroTik host/port/username once at
+startup into an immutable `Config` snapshot -- changing those still needs a restart. Edge, NAS, and
+home-network operational values (including the shared SSH key path) are the opposite: they live in
+Turso (`master_configurations`, source of truth in Turso Cloud) and are re-read fresh from the local
+replica by `TursoCacheManager.read_group()` on every command and every watchdog tick, so an edit
+there applies on the next action once periodic sync has pulled it in, with no restart. The Turso
+connection/sync settings themselves (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`,
+`TURSO_DB_SYNC_INTERVAL`, `TURSO_DB_DOWN_REMINDER`) stay on Infisical, read once at startup, since
+they must exist before the Turso replica does.
 
 The detailed secret catalog, defaults, and validation rules are in
-[WORKFLOW.md](./WORKFLOW.md#9-configuration-reference).
+[WORKFLOW.md](./WORKFLOW.md#9-configuration-reference); the full Turso bootstrap/sync/notification
+lifecycle is in [WORKFLOW.md §1](./WORKFLOW.md#1-runtime-overview) and
+[§7.3](./WORKFLOW.md#73-turso-synchronization-watchdog).
 
 ## 7. Container deployment
 
@@ -166,12 +181,16 @@ The Docker image is based on `python:3.11-slim` and installs:
 
 - `openssh-client` for all SSH paths;
 - `iputils-ping` for manual and watchdog network probes;
-- Python dependencies from `requirements.txt` (`discord.py==2.5.1` and `infisicalsdk`).
+- Python dependencies from `requirements.txt` (`discord.py==2.5.1`, `infisicalsdk`, and
+  `pyturso==0.7.2` for the Turso/libSQL local replica and its synchronization watchdog).
 
 The container runs `python -m commander.bot`, has `restart: unless-stopped`, publishes no ports,
-and mounts the VPS `~/.ssh` directory read-only at `/root/.ssh`. The broad SSH mount and current host
-key policy are deliberate topics in [AUDIT.md](./AUDIT.md), not endorsements of that long-term
-deployment shape.
+mounts the VPS `~/.ssh` directory read-only at `/root/.ssh`, and mounts a dedicated
+`commander_turso_data` volume at `/data/turso` for the local Turso replica (intentionally deleted
+and rebuilt from Turso Cloud on every container start; see
+[WORKFLOW.md §7.3](./WORKFLOW.md#73-turso-synchronization-watchdog)). The broad SSH mount and
+current host key policy are deliberate topics in [AUDIT.md](./AUDIT.md), not endorsements of that
+long-term deployment shape.
 
 ## 8. Availability and state recovery
 
@@ -197,7 +216,8 @@ outage from the restarted process if the network is still unreachable.
 | Discord Commander application behaviour | `commander/` in this repository |
 | Operator documentation | `README.md` and `machine_lore/` in this repository |
 | Container build/runtime declaration | `Dockerfile`, `docker-compose.yml` |
-| Application token, IDs, targets, scripts, timing | Infisical |
+| Discord identity, MikroTik identity, Turso connection/sync settings | Infisical |
+| Edge, NAS, and home-network operational values (`master_configurations`) | Turso Cloud |
 | Universal Auth bootstrap files | VPS `~/secrets/infisical/` |
 | Discord guild/channel roles and bot install | Discord administration |
 | VPS firewall, Docker daemon, host SSH, mounted identities | VPS administration |

@@ -176,11 +176,18 @@ Recommended action: if cause classification matters, export a WireGuard handshak
 or an independent home probe and include it in the alert decision. Preserve the current transition
 semantics so alerts are not silently dropped.
 
-### CFG-01: Configuration needs restart to take effect
+### CFG-01: Some configuration needs a restart to take effect
 
-Configuration is materialized once in `load_config()` before the bot starts. Restart the container
-after changing any Infisical application value. This is documented behaviour, not a secret-refresh
-failure.
+This finding is narrower than before the Turso migration. Discord identity and MikroTik
+host/port/username are still materialized once in `load_config()` before the bot starts, so
+changing an Infisical value in either group still requires a container restart. Edge, NAS, and
+home-network operational values (including the shared SSH key path) instead live in Turso and are
+re-read fresh from the local replica on every command and every watchdog tick
+(`commander/turso/cache_manager.py`, `machine_lore/ARCHITECTURE.md` §6); an edit there applies on
+the next action once periodic sync has pulled it in, with no restart. The Turso connection/sync
+settings themselves (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TURSO_DB_SYNC_INTERVAL`,
+`TURSO_DB_DOWN_REMINDER`) are Infisical values read once at startup and still require a restart to
+change. This is documented behaviour, not a secret-refresh failure.
 
 ### OPS-01: Production controls need external verification
 
