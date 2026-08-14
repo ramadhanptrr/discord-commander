@@ -123,11 +123,17 @@ class TursoProdWriter:
         recovery contract for a connection object after a failed push, so the safe default is a
         fresh connection (and therefore a fresh pull/schema baseline) on the next attempt instead
         of risking a wedged connection retried forever.
+
+        ``commit()`` before ``push()`` is required, not optional: like the standard DB-API,
+        ``execute()`` alone does not commit the write, and ``push()`` only syncs already-committed
+        changes. Without it this silently "succeeds" (no exception, so the caller believes the
+        write is durable) while pushing nothing at all.
         """
         try:
             if self._connection is None:
                 self._connection = self._connect_blocking()
             self._connection.execute(sql, params)
+            self._connection.commit()
             self._connection.push()
         except Exception as error:
             self._discard_connection_blocking()
