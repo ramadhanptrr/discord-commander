@@ -109,6 +109,7 @@ class CommanderBot(commands.Bot):
         )
         self._watchdog_notifier = watchdog_notifier
         self._turso_cache = turso_cache
+        self._turso_sync_task: asyncio.Task[None] | None = None
         nas = NasController(turso_cache, mikrotik)
         self._operations = OperatorOperations(
             turso_cache,
@@ -237,6 +238,10 @@ class CommanderBot(commands.Bot):
 
     async def on_ready(self) -> None:
         logger.info("Discord Commander connected as %s", self.user)
+        if self._turso_sync_task is None or self._turso_sync_task.done():
+            self._turso_sync_task = asyncio.create_task(
+                self._turso_cache.run_periodic_sync(), name="turso-sync"
+            )
         await self._notify_startup_once()
 
     async def _notify_startup_once(self) -> None:
@@ -271,7 +276,15 @@ class CommanderBot(commands.Bot):
             logger.info("Sent Commander startup notification to watchdog channel")
 
     async def close(self) -> None:
-        logger.info("Closing Turso local database resources.")
+        if self._turso_sync_task is not None and not self._turso_sync_task.done():
+            self._turso_sync_task.cancel()
+            try:
+                await self._turso_sync_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Turso sync task ended with an unexpected error during shutdown")
+        logger.info("Stopping Turso database synchronization task.")
         await self._turso_cache.aclose()
         await super().close()
 
@@ -292,12 +305,14 @@ class CommanderBot(commands.Bot):
 def main() -> None:
     turso_config = load_turso_config()
     turso_cache = TursoCacheManager(turso_config, TURSO_LOCAL_DB_PATH)
-    # Worker Pooling is the sole owner of bootstrap()/periodic sync against the shared local
-    # replica volume; Commander only ever opens read-only local connections against the same file,
-    # so this just allows those reads instead of pulling from Turso Cloud itself. This must still
-    # happen before load_config() below, which reads edge/NAS/home-network values out of the
-    # replica. See migrations/worker_split_shared_cache.md.
-    turso_cache.mark_externally_bootstrapped()
+    # Commander and Worker Pooling each own an independent local replica on their own volume (not
+    # shared -- pyturso's synchronized connection holds a cross-process lock on the replica's -wal
+    # file for its entire lifetime, so a second process opening its own read connections against
+    # the same file fails outright, not just intermittently. See
+    # migrations/worker_split_shared_cache.md). Fresh replica on every process start (see
+    # machine_lore/ARCHITECTURE.md); this must finish before load_config() below, which reads
+    # edge/NAS/home-network values out of the replica.
+    asyncio.run(turso_cache.bootstrap())
 
     config = load_config(turso_cache)
     logger.info(

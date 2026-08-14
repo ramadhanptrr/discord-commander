@@ -4,9 +4,6 @@ services:
     container_name: discord-commander
     command: ["python", "-m", "commander.bot"]
     restart: unless-stopped
-    depends_on:
-      worker:
-        condition: service_healthy
     secrets:
       - infisical_client_id
       - infisical_client_secret
@@ -21,23 +18,13 @@ services:
       TURSO_LOCAL_DB_PATH: ${TURSO_LOCAL_DB_PATH:-/data/turso/local.db}
     volumes:
       - ~/.ssh:/root/.ssh:ro
-      - shared_turso_data:/data/turso
+      - commander_turso_data:/data/turso
 
   worker:
     build: .
     container_name: worker-pooling
     command: ["python", "-m", "worker.main"]
     restart: unless-stopped
-    # Commander depends on this to know the shared local replica has been bootstrapped at least
-    # once before it starts reading it (see the `depends_on` above and
-    # migrations/worker_split_shared_cache.md). Only guards the first cold start of the volume --
-    # later independent restarts of either container find the file already there.
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /data/turso/local.db"]
-      interval: 5s
-      timeout: 3s
-      retries: 24
-      start_period: 15s
     secrets:
       - infisical_client_id
       - infisical_client_secret
@@ -52,7 +39,7 @@ services:
       TURSO_LOCAL_DB_PATH: ${TURSO_LOCAL_DB_PATH:-/data/turso/local.db}
     volumes:
       - ~/.ssh:/root/.ssh:ro
-      - shared_turso_data:/data/turso
+      - worker_turso_data:/data/turso
 
 secrets:
   infisical_client_id:
@@ -63,4 +50,5 @@ secrets:
     file: ~/secrets/infisical/INFISICAL_PROJECT_ID
 
 volumes:
-  shared_turso_data:
+  commander_turso_data:
+  worker_turso_data:

@@ -130,18 +130,6 @@ class TursoCacheManager:
         """Wire the Discord watchdog notifier once the bot/channel exist (see lifecycle notes)."""
         self._notifier = notifier
 
-    def mark_externally_bootstrapped(self) -> None:
-        """Allow local reads against a replica file that another process owns.
-
-        Worker Pooling is the sole owner of ``bootstrap()``/``run_periodic_sync()`` against the
-        shared local replica volume; Commander only ever opens read-only local connections
-        (``read_group()``/``read_latest_event()``) against the same file. Call this instead of
-        ``bootstrap()`` so those reads are allowed without this instance ever pulling from Turso
-        Cloud, writing, or deleting the file itself. See
-        migrations/worker_split_shared_cache.md.
-        """
-        self._bootstrapped = True
-
     # -- startup bootstrap --------------------------------------------------------------
 
     async def bootstrap(self) -> None:
