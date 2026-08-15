@@ -1,0 +1,8 @@
+.git
+.github
+machine_lore
+README.md
+**/__pycache__
+*.pyc
+.venv
+venv
